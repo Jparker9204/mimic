@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.db-*
+.env
+*.env
+!deploy/*.example
+.pytest_cache/
+dry_run_*.json

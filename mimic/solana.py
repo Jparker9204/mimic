@@ -119,7 +119,9 @@ class Rpc:
             for s in page:
                 if (s.get("blockTime") or 0) < since_ts:
                     return out
-                out.append(s)
+                # keep only what we use (coin scans can page through tens of thousands)
+                out.append({"signature": s["signature"], "slot": s.get("slot"), "blockTime": s.get("blockTime"),
+                            "err": s.get("err")})
             if len(page) < 1000:
                 break
             before = page[-1]["signature"]

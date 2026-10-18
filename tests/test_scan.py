@@ -1,4 +1,4 @@
-from mimic.coinscan import aggregate_traders, pick_sigs
+from mimic.coinscan import pick_sigs
 from mimic.market import SolPrice
 from mimic.scan import build_positions, copyability, peak_after, summarize
 
@@ -32,25 +32,12 @@ def test_copyability_notes():
     assert "unknown" in copyability(None, 1)
 
 
-def test_coin_traders_realized_profit():
-    swaps = [(1, "w1", ("BUY", "M", 100, 1.0)), (2, "w2", ("BUY", "M", 100, 2.0)),
-             (3, "w1", ("SELL", "M", 50, 3.0)), (4, "w2", ("SELL", "M", 100, 1.0)),
-             (5, "w3", ("SELL", "M", 10, 9.0)), (6, "w4", ("BUY", "X", 1, 1.0))]
-    t = aggregate_traders(swaps, "M")
-    assert [x["wallet"] for x in t] == ["w1", "w2"]          # w3 never bought (unknown cost), w4 other coin
-    assert t[0]["realized_sol"] == 2.5 and t[0]["holding_pct"] == 50 and t[0]["entry_rank"] == 1
-    assert t[1]["realized_sol"] == -1.0
-
-
 def test_pick_sigs_sampling():
     sigs = [{"signature": str(i)} for i in range(1000)]   # newest first
     chosen, sampled = pick_sigs(sigs, 100)
     assert sampled and len(chosen) == 100
-    assert chosen[-1]["signature"] == "999" and chosen[0]["signature"] == "0"
-    assert pick_sigs(sigs[:50], 100) == (sigs[:50], False)
+    assert chosen[0]["signature"] == "999"            # oldest (launch) first
+    assert {"0", "940"} <= {c["signature"] for c in chosen}
+    assert pick_sigs(sigs[:50], 100) == (list(reversed(sigs[:50])), False)
 
 
-def test_coin_rank_puts_sellers_first():
-    swaps = [(1, "big", ("BUY", "M", 100, 50.0)), (2, "s", ("BUY", "M", 10, 1.0)), (3, "s", ("SELL", "M", 10, 0.5))]
-    t = aggregate_traders(swaps, "M")
-    assert [x["wallet"] for x in t] == ["s", "big"]

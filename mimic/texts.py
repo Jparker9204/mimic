@@ -53,17 +53,37 @@ def sim_text(wallet: str, label: str, summ: dict) -> str:
 
 
 def coin_scan_text(res: dict) -> str:
-    head = f"🪙 <b>{html.escape(res['sym'])}</b> ({short(res['mint'])}) · top traders by profit"
-    if not res["traders"]:
-        return head + "\n\nNo clear buy/sell trades found."
+    head = f"🪙 <b>{html.escape(res['sym'])}</b> ({short(res['mint'])}) · top real traders by profit"
     rows = []
     for i, t in enumerate(res["traders"], 1):
         pnl = f"{t['realized_sol']:+.2f} SOL" if t["sells"] else "no sells yet"
         rows.append(f"{i}. <code>{short(t['wallet'])}</code> {pnl} · in {t['sol_in']:.2f} · "
                     f"entry #{t['entry_rank']} · holds {t['holding_pct']}%")
-    note = (f"<i>Based on {res['txs']} of {res['sigs']}{'+' if res['sigs'] >= 5000 else ''} trades "
+    if not rows:
+        rows = ["No real traders (0.05+ SOL in) found."]
+    extra = []
+    if res.get("flagged_count"):
+        extra.append(f"🚩 Hid {res['flagged_count']} bundle/transfer wallet{'s' if res['flagged_count'] != 1 else ''}")
+    if res.get("small"):
+        extra.append(f"🤏 {res['small']} tiny buyers (under 0.05 SOL) not ranked")
+    if not res.get("launch_checked", True):
+        extra.append("<i>Too many trades to see the launch — launch-block check skipped.</i>")
+    note = (f"<i>Based on {res['txs']} of {res['sigs']}{'+' if res['sigs'] >= res.get('sig_cap', 5000) else ''} trades "
             f"(earliest + newest) — approximate.</i>" if res["sampled"] else f"<i>Based on all {res['txs']} trades.</i>")
-    return "\n".join([head, ""] + rows + ["", note])
+    return "\n".join([head, ""] + rows + [""] + extra + [note])
+
+
+def flagged_text(res: dict) -> str:
+    fl = res.get("flagged") or []
+    if not fl:
+        return "🚩 No flagged wallets for this coin."
+    rows = [f"🚩 <b>Flagged wallets · {html.escape(res['sym'])}</b>"]
+    for t in fl:
+        rows.append(f"🚩 <code>{short(t['wallet'])}</code> in {t['sol_in']:.2f} → out {t['sol_out']:.2f} · "
+                    + html.escape(", ".join(t.get("reasons") or [])))
+    if res.get("flagged_count", 0) > len(fl):
+        rows.append(f"<i>…and {res['flagged_count'] - len(fl)} more</i>")
+    return "\n".join(rows)
 
 
 def limits_text(usage: dict, user_id: int, now: float | None = None) -> str:

@@ -135,7 +135,7 @@ class MimicBot:
 
     def _coin_work(self, mint: str):
         async def work(progress):
-            key = "coin:" + mint
+            key = "coin2:" + mint
             res = self.db.cache_get(key)
             if res is None:
                 try:
@@ -151,6 +151,8 @@ class MimicBot:
                     row = []
             if row:
                 rows.append(row)
+            if res.get("flagged_count"):
+                rows.append([B("🚩 Show flagged", callback_data="cf:" + mint)])
             rows.append(home_row())
             return texts.coin_scan_text(res), KB(rows)
         return work
@@ -239,6 +241,13 @@ class MimicBot:
                 await self.start_kind(update, ctx, "wallet" if data == "as:w" else "coin", addr)
         elif data.startswith("ws:"):
             await self.start_kind(update, ctx, "wallet", data[3:])
+        elif data.startswith("cf:"):
+            res = self.db.cache_get("coin2:" + data[3:])
+            if res is None:
+                await q.message.reply_text("That scan expired — run the Coin Scan again.", reply_markup=KB([home_row()]))
+            else:
+                await q.message.reply_text(texts.flagged_text(res), parse_mode=ParseMode.HTML,
+                                           reply_markup=KB([home_row()]), disable_web_page_preview=True)
         elif data == "retry":
             r = ud.pop("retry", None)
             if r:

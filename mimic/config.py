@@ -44,6 +44,7 @@ MAX_TXS = _int("MIMIC_MAX_TXS", 800)
 TX_BUDGET_S = _int("MIMIC_TX_BUDGET_S", 100)     # time budget for fetching wallet txs
 MAX_TOKENS = _int("MIMIC_MAX_TOKENS", 40)        # newest tokens priced per scan
 COIN_MAX_TXS = _int("MIMIC_COIN_MAX_TXS", 400)
+COIN_MAX_SIGS = _int("MIMIC_COIN_MAX_SIGS", 50000)   # page back this far to find the launch
 CACHE_TTL_S = _int("MIMIC_CACHE_TTL_MIN", 45) * 60
 
 # Sim cost assumptions

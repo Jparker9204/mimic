@@ -15,7 +15,14 @@ A Telegram bot that tells you whether a Solana wallet is worth copy-trading. Eve
   - Assumptions are conservative: 2% entry slippage, 1% fee each way, and 0.0005 SOL per transaction.
   - If one candle touches both the stop-loss and the take-profit, the stop-loss wins. Checks start at the candle after entry.
   - Only each coin's first buy is copied.
-- **🪙 Coin Scan.** Paste a coin's mint to see the top 10 traders on that coin by realized profit (average-cost basis), with their entry order and how much they still hold. One tap runs a Wallet Scan on any of them.
+- **🪙 Coin Scan.** Paste a coin's mint to see the top 10 *real* traders on that coin by realized profit (average-cost basis, counting only tokens they actually bought), with their entry order and how much they still hold. One tap runs a Wallet Scan on any of them. Bundle and transfer wallets are hidden ("🚩 Hid N bundle/transfer wallets"); tap **🚩 Show flagged** to see them with the reason:
+  - **dev wallet:** the coin's creator;
+  - **bought in launch block:** bought in the creation block or the first trading block;
+  - **same-block bundle:** 3+ wallets bought in one block with SOL amounts within ~10% of each other;
+  - **got tokens by transfer / from dev:** at least half its tokens arrived by transfer, or it received tokens from the dev;
+  - **no real buy:** spent under 0.01 SOL in total.
+  
+  Only wallets that put in at least 0.05 SOL are ranked.
 - **Limits** (per Telegram user, per UTC day): 5 wallet scans, 3 coin scans, 2 sims.
   - 25s cooldown between checks, with a live countdown.
   - At most 2 heavy jobs run at once; others are told "you're #N in line".

@@ -44,7 +44,7 @@ async def main() -> None:
     for p in (SimParams(0.2, 0, 1.5, "mirror"), SimParams(0.2, 15, 2.0, "mirror"), SimParams(0.2, 15, 1.5, "sl", 0.3)):
         t1 = time.monotonic()
         res = simulate(trades, p, sol.at, now=scan["scanned_at"])
-        print(plain(texts.sim_text(a.wallet, p.label(), res.summary)), f"\n  (sim math {time.monotonic() - t1:.2f}s)\n")
+        print(plain(texts.sim_text(a.wallet, p.label(), res.summary, p.delay_s)), f"\n  (sim math {time.monotonic() - t1:.2f}s)\n")
 
     # the bot caches finished scans; a repeat scan (same wallet within 45 min) is a cache read
     db.cache_set("scan:" + a.wallet, scan, 2700)

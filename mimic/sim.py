@@ -21,7 +21,7 @@ Candle = tuple  # (start_ts, seconds, open, high, low, close)
 @dataclass
 class SimParams:
     size_sol: float = 0.1
-    delay_s: int = 0
+    delay_s: int = 15               # realistic copy delay (not a user choice in the UI)
     tp: float | None = 1.5          # take-profit multiple, e.g. 1.5 = +50%; None = no TP
     exit: str = "mirror"            # "mirror" (sell when the wallet sells) or "sl"
     sl: float = 0.30                # stop-loss drop, 0.30 = -30% (used when exit == "sl")
@@ -30,9 +30,9 @@ class SimParams:
     net_fee: float = config.NETWORK_FEE_SOL
 
     def label(self) -> str:
-        tp = "no TP" if not self.tp else (f"TP {self.tp:g}x" if self.tp >= 2 else f"TP +{(self.tp - 1) * 100:.0f}%")
-        ex = "mirror wallet sell" if self.exit == "mirror" else f"SL -{self.sl * 100:.0f}%"
-        return f"{self.size_sol:g} SOL · {self.delay_s}s delay · {tp} · {ex}"
+        tp = "none" if not self.tp else (f"{self.tp:g}x" if self.tp >= 2 else f"+{(self.tp - 1) * 100:.0f}%")
+        ex = "when the wallet sells" if self.exit == "mirror" else f"stop-loss -{self.sl * 100:.0f}%"
+        return f"Size: {self.size_sol:g} SOL per trade · Take profit: {tp} · Exit: {ex}"
 
 
 @dataclass

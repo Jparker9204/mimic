@@ -13,10 +13,13 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from . import config
+from .market import SolPrice
 from .scan import Services
 from .solana import STABLES, WSOL, parse_swap
 
 MIN_REAL_SOL = 0.05     # rank only traders who put in at least this much
+MIN_PROFIT_SOL = 0.1    # "real profit" = at least this much SOL...
+MIN_PROFIT_PCT = 0.10   # ...and at least 10% of what they put in
 NO_BUY_SOL = 0.01       # below this, the wallet basically didn't buy
 CLUSTER_MIN = 3         # wallets in one block with similar size
 CLUSTER_SPREAD = 1.10   # max/min SOL ratio inside a cluster
@@ -121,6 +124,8 @@ def aggregate_traders(swaps: list[dict], transfers: list[dict] | None = None, *,
         proceeds = x["sol_out"] * (bought_sold / x["tok_out"]) if x["tok_out"] else 0.0
         x["realized_sol"] = round(proceeds - x["sol_in"] * sold_frac, 4)
         x["holding_pct"] = round(100 * (1 - sold_frac)) if x["tok_in"] else 0
+        x["held_tokens"] = max(0.0, x["tok_in"] - bought_sold)
+        x["held_cost_sol"] = x["sol_in"] * (1 - sold_frac)
         x["flags"] = sorted(x["flags"])
         x["reasons"] = [REASONS[f] for f in x["flags"]]
         if x["flags"]:
@@ -132,6 +137,49 @@ def aggregate_traders(swaps: list[dict], transfers: list[dict] | None = None, *,
     ranked.sort(key=lambda x: (x["sells"] == 0, -x["realized_sol"] if x["sells"] else -x["sol_in"]))
     flagged.sort(key=lambda x: -(x["sol_out"] + x["sol_in"]))
     return ranked, flagged, small
+
+
+def apply_balance(x: dict, balance: float | None) -> None:
+    """Trust the on-chain balance over our sampled history: if the wallet now holds fewer tokens than we
+    think, it sold/moved them in trades we didn't read. That part is treated as sold at cost (no gain)."""
+    if balance is None or x.get("held_tokens", 0.0) <= 0:
+        return
+    x["balance_ok"] = True
+    held = x["held_tokens"]
+    actual = min(balance, held)
+    if actual < held:
+        x["held_cost_sol"] *= actual / held if held else 0.0
+        x["held_tokens"] = actual
+        x["holding_pct"] = round(100 * actual / x["tok_in"]) if x["tok_in"] else 0
+        x["balance_checked"] = True
+
+
+def unrealized(x: dict, price_sol: float | None, require_verified: bool = False) -> float:
+    if not price_sol or x.get("held_tokens", 0.0) <= 0:
+        return 0.0
+    if require_verified and not x.get("balance_ok"):
+        return 0.0                      # holding not confirmed on-chain: count sells only
+    return x["held_tokens"] * price_sol - x.get("held_cost_sol", 0.0)
+
+
+def estimate_profit(x: dict, price_sol: float | None) -> float:
+    return x["realized_sol"] + unrealized(x, price_sol)
+
+
+def rank_profitable(traders: list[dict], price_sol: float | None, limit: int = 10,
+                    require_verified: bool = False) -> list[dict]:
+    """Total profit = realized + value of still-held (bought) tokens at today's price minus their cost.
+    Keep only real winners: profit >= max(0.1 SOL, 10% of SOL put in). Never returns losers."""
+    out = []
+    for x in traders:
+        unreal = unrealized(x, price_sol, require_verified)
+        x["unrealized_sol"] = round(unreal, 4)
+        x["profit_sol"] = round(x["realized_sol"] + unreal, 4)
+        x["profit_pct"] = round(100 * x["profit_sol"] / x["sol_in"]) if x["sol_in"] else 0
+        if x["profit_sol"] >= max(MIN_PROFIT_SOL, MIN_PROFIT_PCT * x["sol_in"]):
+            out.append(x)
+    out.sort(key=lambda x: -x["profit_sol"])
+    return out[:limit]
 
 
 def pick_sigs(sigs_newest_first: list[dict], cap: int) -> tuple[list[dict], bool]:
@@ -174,8 +222,16 @@ async def coin_scan(svc: Services, mint: str, progress=None) -> dict:
         launch_slots.add(min(buy_slots))
     ranked, flagged, small = aggregate_traders(swaps, transfers, dev=dev, launch_slots=launch_slots)
     dex = (await svc.market.dex_info([mint])).get(mint)
+    price_sol = None
+    if dex and dex.get("price"):
+        price_sol = dex["price"] / SolPrice(await svc.market.sol_usd_series()).at(time.time())
+    # verify current holdings of the likely winners on-chain (sampled history can miss their later sells)
+    cands = sorted((x for x in ranked if x.get("held_tokens", 0) > 0), key=lambda x: -estimate_profit(x, price_sol))
+    for x in cands[:15] if price_sol else []:
+        apply_balance(x, await svc.rpc.token_balance(x["wallet"], mint))
+    winners = rank_profitable(ranked, price_sol, require_verified=True)
     return {"mint": mint, "sym": (dex or {}).get("sym") or "?", "sigs": len(sigs), "txs": len(got),
-            "sampled": sampled or not full_history, "sig_cap": cap, "swaps": len(swaps), "traders": ranked[:10],
-            "total_traders": len(ranked), "flagged": flagged[:25], "flagged_count": len(flagged), "small": small,
+            "sampled": sampled or not full_history, "sig_cap": cap, "swaps": len(swaps), "traders": winners,
+            "real_traders": len(ranked), "priced": price_sol is not None, "flagged": flagged[:25], "flagged_count": len(flagged), "small": small,
             "dev": dev, "launch_checked": bool(launch_slots), "seconds": round(time.monotonic() - t0, 1),
             "first_seen": min((s.get("blockTime") or 0) for s in sigs)}

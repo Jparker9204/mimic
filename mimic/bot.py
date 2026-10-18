@@ -111,7 +111,10 @@ class MimicBot:
                                   "try again in a minute.", KB([home_row()]))
             return
         self.db.finish_check(cid, True)
-        await self._edit(msg, f"{text}\n\nCheck #{cid} ✅ · {time.monotonic() - t0:.0f}s", kb)
+        parts = texts.split_message(f"{text}\n\nCheck #{cid} ✅ · {time.monotonic() - t0:.0f}s")
+        await self._edit(msg, parts[0], kb if len(parts) == 1 else None)
+        for i, part in enumerate(parts[1:], 2):
+            await self._send(chat_id, ctx, part, kb if i == len(parts) else None)
 
     # ---------------------------------------------------------------- jobs
     def _wallet_work(self, wallet: str, ctx):
@@ -135,7 +138,7 @@ class MimicBot:
 
     def _coin_work(self, mint: str):
         async def work(progress):
-            key = "coin2:" + mint
+            key = "coin3:" + mint
             res = self.db.cache_get(key)
             if res is None:
                 try:
@@ -165,7 +168,7 @@ class MimicBot:
                 raise UserError("No coins with price data to simulate for this wallet.")
             res = simulate(trades, p, sol.at, now=scan["scanned_at"])
             kb = KB([[B("🧪 New sim", callback_data="sim:new"), B("🔍 Wallet", callback_data="ws:" + wallet)], home_row()])
-            return texts.sim_text(wallet, p.label(), res.summary), kb
+            return texts.sim_text(wallet, p.label(), res.summary, p.delay_s), kb
         return work
 
     async def start_kind(self, update: Update, ctx, kind: str, target: str) -> None:
@@ -185,24 +188,20 @@ class MimicBot:
         w = ctx.user_data.get("last_wallet", "")
         step = ctx.user_data.get("sim_step", "size")
         if step == "size":
-            return (f"🧪 Sim for {short(w)}\n<b>1/4 · Size per trade?</b>",
+            return (f"🧪 <b>Copytrade Sim</b> · {short(w)}\n<b>Step 1 of 3: how much SOL per trade?</b>",
                     KB([[B(x + " SOL", callback_data="sz:" + x) for x in ("0.1", "0.2", "0.5", "1")],
-                        [B("✏️ Custom", callback_data="sz:c")], home_row()]))
-        if step == "delay":
-            return ("<b>2/4 · How fast do you copy?</b>",
-                    KB([[B("⚡ 0s", callback_data="dl:0"), B("15s", callback_data="dl:15"), B("60s", callback_data="dl:60")],
-                        home_row()]))
+                        [B("✏️ Custom amount", callback_data="sz:c")], home_row()]))
         if step == "tp":
-            return ("<b>3/4 · Take profit?</b>",
+            return ("<b>Step 2 of 3: take profit at?</b>",
                     KB([[B("+25%", callback_data="tp:1.25"), B("+50%", callback_data="tp:1.5"),
-                         B("2x", callback_data="tp:2"), B("None", callback_data="tp:0")], home_row()]))
+                         B("2x", callback_data="tp:2"), B("No take profit", callback_data="tp:0")], home_row()]))
         if step == "exit":
-            return ("<b>4/4 · Otherwise exit how?</b>",
-                    KB([[B("🪞 When wallet sells", callback_data="ex:m")],
-                        [B("🛑 Stop-loss -30%", callback_data="ex:sl30"), B("✏️ Custom SL", callback_data="ex:c")],
+            return ("<b>Step 3 of 3: otherwise, when to sell?</b>",
+                    KB([[B("🪞 When the wallet sells", callback_data="ex:m")],
+                        [B("🛑 Stop-loss -30%", callback_data="ex:sl30"), B("✏️ Custom stop-loss", callback_data="ex:c")],
                         home_row()]))
         p = SimParams(**s)
-        return (f"🧪 <b>Ready</b>\n{p.label()}",
+        return (f"🧪 <b>Ready to run</b>\n{p.label()}\n<i>Assumes ~{p.delay_s}s copy delay.</i>",
                 KB([[B("▶️ Run sim", callback_data="sim:run")], [B("✏️ Change", callback_data="sim:new")], home_row()]))
 
     # ---------------------------------------------------------------- handlers
@@ -242,12 +241,14 @@ class MimicBot:
         elif data.startswith("ws:"):
             await self.start_kind(update, ctx, "wallet", data[3:])
         elif data.startswith("cf:"):
-            res = self.db.cache_get("coin2:" + data[3:])
+            res = self.db.cache_get("coin3:" + data[3:])
             if res is None:
                 await q.message.reply_text("That scan expired — run the Coin Scan again.", reply_markup=KB([home_row()]))
             else:
-                await q.message.reply_text(texts.flagged_text(res), parse_mode=ParseMode.HTML,
-                                           reply_markup=KB([home_row()]), disable_web_page_preview=True)
+                parts = texts.split_message(texts.flagged_text(res))
+                for i, part in enumerate(parts, 1):
+                    await q.message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                                               reply_markup=KB([home_row()]) if i == len(parts) else None)
         elif data == "retry":
             r = ud.pop("retry", None)
             if r:
@@ -262,7 +263,7 @@ class MimicBot:
         elif data == "sim:run":
             if ud.get("last_wallet"):
                 await self.start_kind(update, ctx, "sim", ud["last_wallet"])
-        elif data[:3] in ("sz:", "dl:", "tp:", "ex:"):
+        elif data[:3] in ("sz:", "tp:", "ex:"):
             await self._sim_choice(update, ctx, data)
 
     async def _sim_choice(self, update: Update, ctx, data: str) -> None:
@@ -274,9 +275,7 @@ class MimicBot:
                 ud["await"] = "custom_size"
                 await update.callback_query.message.reply_text("✏️ Type a size in SOL (e.g. 0.3)")
                 return
-            s["size_sol"], ud["sim_step"] = float(v), "delay"
-        elif k == "dl":
-            s["delay_s"], ud["sim_step"] = int(v), "tp"
+            s["size_sol"], ud["sim_step"] = float(v), "tp"
         elif k == "tp":
             s["tp"], ud["sim_step"] = (float(v) or None), "exit"
         elif k == "ex":
@@ -304,7 +303,7 @@ class MimicBot:
                 if not 0.01 <= val <= 100:
                     await update.effective_message.reply_text("Please type a number between 0.01 and 100.")
                     return
-                s["size_sol"], ud["sim_step"] = val, "delay"
+                s["size_sol"], ud["sim_step"] = val, "tp"
             else:
                 if not 1 <= val <= 95:
                     await update.effective_message.reply_text("Please type a number between 1 and 95.")

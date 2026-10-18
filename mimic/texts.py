@@ -1,86 +1,121 @@
 """Short, plain message formatting (Telegram HTML)."""
 from __future__ import annotations
 import html, time
-from .solana import short
 
 
 def _p(v) -> str:
     return "–" if v is None else f"{v}%"
 
 
+def ordinal(n: int) -> str:
+    suf = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suf}"
+
+
+def addr(a: str) -> str:
+    """Full address in monospace: tap-to-copy in Telegram."""
+    return f"<code>{html.escape(a)}</code>"
+
+
+def split_message(text: str, limit: int = 4000) -> list[str]:
+    """Split on line breaks so each part fits Telegram's 4096-char limit (never inside a line/tag)."""
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:                       # pathological single line
+            parts.append(line[:limit])
+            line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    return parts
+
+
 def wallet_scan_text(res: dict) -> str:
     s = res["stats"]
     cov_days = (res["scanned_at"] - res["covered_from"]) / 86400
-    cover = f"last {res['days']} days"
+    period = f"Last {res['days']} days"
     if res["capped"]:
-        cover += f" (only the newest {cov_days:.1f} days could be read: {res['txs']} txs)"
+        period += f" (could only read the newest {cov_days:.1f} days)"
+    head = [f"🔍 <b>Wallet Scan</b>", addr(res["wallet"]), f"📅 {period}"]
     if s["tokens"] == 0:
-        return (f"🔍 <b>Wallet {short(res['wallet'])}</b>\n📅 {cover}\n\n"
-                "No token buys found in this window.")
+        return "\n".join(head + ["", "No coin buys found in this period."])
     net = s["sol_out"] - s["sol_in"]
-    hold = "–" if s["median_hold_min"] is None else f"{s['median_hold_min']:g} min"
-    lines = [
-        f"🔍 <b>Wallet {short(res['wallet'])}</b>",
-        f"📅 {cover}",
-        f"🪙 Coins bought: <b>{s['tokens']}</b> · {s['buys']} buys ({s['buys_per_token']:g} per coin)",
-        f"🎯 Hit at peak: +25% <b>{_p(s['hit25'])}</b> · +50% <b>{_p(s['hit50'])}</b> · 2x <b>{_p(s['hit2x'])}</b>"
-        + (f" <i>({s['priced']} coins with charts)</i>" if s["priced"] < s["tokens"] else ""),
-        f"📊 Now: 🟢 up {_p(s['up_now'])} · 🔴 down {_p(s['down_now'])} · 💀 dead {_p(s['dead'])}",
-        f"💰 SOL in {s['sol_in']:.2f} → out {s['sol_out']:.2f} ({net:+.2f})",
-        f"⏱ Median hold: <b>{hold}</b>",
+    hold = "unknown (no sells yet)" if s["median_hold_min"] is None else f"{s['median_hold_min']:g} min"
+    charted = f" (of {s['priced']} coins with charts)" if s["priced"] < s["tokens"] else ""
+    lines = head + [
+        "",
+        f"🪙 Coins bought: <b>{s['tokens']}</b> ({s['buys']} buys, about {s['buys_per_token']:g} per coin)",
+        f"🎯 Coins that went up after the buy{charted}:",
+        f"   +25%: <b>{_p(s['hit25'])}</b> · +50%: <b>{_p(s['hit50'])}</b> · 2x: <b>{_p(s['hit2x'])}</b>",
+        f"📊 Today: 🟢 up {_p(s['up_now'])} · 🔴 down {_p(s['down_now'])} · 💀 dead {_p(s['dead'])}",
+        f"💰 SOL spent: {s['sol_in']:.2f} · Got back from sells: {s['sol_out']:.2f} ({net:+.2f})",
+        f"⏱ Typical hold time: <b>{hold}</b>",
         "",
         s["copyability"],
     ]
     return "\n".join(lines)
 
 
-def sim_text(wallet: str, label: str, summ: dict) -> str:
+def sim_text(wallet: str, label: str, summ: dict, delay_s: int = 15) -> str:
     sign = "🟢" if summ["net_sol"] > 0 else "🔴"
     lines = [
-        f"🧪 <b>Copytrade sim · {short(wallet)}</b>",
+        "🧪 <b>Copytrade Sim</b>",
+        addr(wallet),
         html.escape(label),
         "",
-        f"{sign} Net: <b>{summ['net_sol']:+.3f} SOL ({summ['net_pct']:+.1f}%)</b>",
-        f"Trades {summ['trades']} · ✅ {summ['wins']} wins · ❌ {summ['losses']} losses",
-        f"SOL in {summ['sol_in']:.3f} → out {summ['sol_out']:.3f}",
-        f"Worst trade: {summ['worst']:+.3f} SOL · Best: {summ['best']:+.3f} SOL",
+        f"{sign} Result: <b>{summ['net_sol']:+.3f} SOL ({summ['net_pct']:+.1f}%)</b>",
+        f"Trades: {summ['trades']} (✅ {summ['wins']} wins · ❌ {summ['losses']} losses)",
+        f"Put in: {summ['sol_in']:.3f} SOL · Got back: {summ['sol_out']:.3f} SOL",
+        f"Worst trade: {summ['worst']:+.3f} SOL · Best trade: {summ['best']:+.3f} SOL",
     ]
     if summ.get("skipped"):
         lines.append(f"<i>{summ['skipped']} coins skipped (no price data)</i>")
-    lines.append("<i>Copies each coin's first buy only. Includes 2% slippage, 1% fees, 0.0005 SOL/tx. "
-                 "Past results ≠ future.</i>")
+    lines.append(f"<i>Assumes ~{delay_s}s copy delay, 2% slippage, 1% fee each way, 0.0005 SOL per trade. "
+                 "Copies each coin's first buy only. Past results ≠ future.</i>")
     return "\n".join(lines)
 
 
 def coin_scan_text(res: dict) -> str:
-    head = f"🪙 <b>{html.escape(res['sym'])}</b> ({short(res['mint'])}) · top real traders by profit"
+    head = f"🪙 <b>Coin Scan · {html.escape(res['sym'])}</b>\n{addr(res['mint'])}\n<b>Top traders by profit</b>"
     rows = []
     for i, t in enumerate(res["traders"], 1):
-        pnl = f"{t['realized_sol']:+.2f} SOL" if t["sells"] else "no sells yet"
-        rows.append(f"{i}. <code>{short(t['wallet'])}</code> {pnl} · in {t['sol_in']:.2f} · "
-                    f"entry #{t['entry_rank']} · holds {t['holding_pct']}%")
-    if not rows:
-        rows = ["No real traders (0.05+ SOL in) found."]
+        pct = f" ({t['profit_pct']:+d}%)" if t.get("sol_in") else ""
+        rows += [f"{i}. Profit: <b>{t['profit_sol']:+.2f} SOL{pct}</b>",
+                 f"   Put in: {t['sol_in']:.2f} SOL · Still holding: {t['holding_pct']}%",
+                 f"   Bought: #{ordinal(t['entry_rank'])} buyer",
+                 f"   {addr(t['wallet'])}", ""]
+    n = len(res["traders"])
+    if n == 0:
+        rows = ["No wallet made real profit on this coin (at least 0.1 SOL and 10%).", ""]
+    elif n < 10:
+        rows.append(f"Only {n} wallet{'s' if n != 1 else ''} made real profit on this coin.")
     extra = []
     if res.get("flagged_count"):
         extra.append(f"🚩 Hid {res['flagged_count']} bundle/transfer wallet{'s' if res['flagged_count'] != 1 else ''}")
     if res.get("small"):
-        extra.append(f"🤏 {res['small']} tiny buyers (under 0.05 SOL) not ranked")
+        extra.append(f"🤏 Skipped {res['small']} tiny buyers (under 0.05 SOL)")
+    if not res.get("priced", True):
+        extra.append("<i>No current price, so profit counts sells only.</i>")
     if not res.get("launch_checked", True):
-        extra.append("<i>Too many trades to see the launch — launch-block check skipped.</i>")
+        extra.append("<i>Too many trades to see the launch, so the launch-block check was skipped.</i>")
     note = (f"<i>Based on {res['txs']} of {res['sigs']}{'+' if res['sigs'] >= res.get('sig_cap', 5000) else ''} trades "
-            f"(earliest + newest) — approximate.</i>" if res["sampled"] else f"<i>Based on all {res['txs']} trades.</i>")
-    return "\n".join([head, ""] + rows + [""] + extra + [note])
+            f"(earliest + newest), so it's approximate.</i>" if res["sampled"] else f"<i>Based on all {res['txs']} trades.</i>")
+    return "\n".join([head, ""] + rows + extra + [note])
 
 
 def flagged_text(res: dict) -> str:
     fl = res.get("flagged") or []
     if not fl:
         return "🚩 No flagged wallets for this coin."
-    rows = [f"🚩 <b>Flagged wallets · {html.escape(res['sym'])}</b>"]
-    for t in fl:
-        rows.append(f"🚩 <code>{short(t['wallet'])}</code> in {t['sol_in']:.2f} → out {t['sol_out']:.2f} · "
-                    + html.escape(", ".join(t.get("reasons") or [])))
+    rows = [f"🚩 <b>Flagged wallets · {html.escape(res['sym'])}</b>", ""]
+    for i, t in enumerate(fl, 1):
+        rows += [f"{i}. 🚩 {html.escape(', '.join(t.get('reasons') or []))}",
+                 f"   Put in: {t['sol_in']:.2f} SOL · Got back: {t['sol_out']:.2f} SOL",
+                 f"   {addr(t['wallet'])}", ""]
     if res.get("flagged_count", 0) > len(fl):
         rows.append(f"<i>…and {res['flagged_count'] - len(fl)} more</i>")
     return "\n".join(rows)

@@ -11,11 +11,11 @@ A Telegram bot that tells you whether a Solana wallet is worth copy-trading. Eve
   - how many of those coins are up, down, or dead now (liquidity < $1k or no pair);
   - SOL spent vs SOL back from sells;
   - median hold time, plus a plain "copyability" note (e.g. *flips in under 2 min = hard to copy*).
-- **🧪 Copytrade Sim.** Runs after a scan. Pick a size (0.1/0.2/0.5/1/custom SOL), a delay (0/15/60s), a take-profit (+25%/+50%/2x/none) and an exit (sell when the wallet sells / -30% stop-loss / custom stop-loss). You get net SOL, %, wins/losses, and the worst trade.
+- **🧪 Copytrade Sim.** Runs after a scan. It has three steps: size (0.1/0.2/0.5/1/custom SOL), take-profit (+25%/+50%/2x/none) and exit (sell when the wallet sells / -30% stop-loss / custom stop-loss). It assumes a realistic ~15s copy delay. You get net SOL, %, wins/losses, and the worst trade.
   - Assumptions are conservative: 2% entry slippage, 1% fee each way, and 0.0005 SOL per transaction.
   - If one candle touches both the stop-loss and the take-profit, the stop-loss wins. Checks start at the candle after entry.
   - Only each coin's first buy is copied.
-- **🪙 Coin Scan.** Paste a coin's mint to see the top 10 *real* traders on that coin by realized profit (average-cost basis, counting only tokens they actually bought), with their entry order and how much they still hold. One tap runs a Wallet Scan on any of them. Bundle and transfer wallets are hidden ("🚩 Hid N bundle/transfer wallets"); tap **🚩 Show flagged** to see them with the reason:
+- **🪙 Coin Scan.** Paste a coin's mint to see up to 10 *real* traders who made meaningful profit on that coin: at least 0.1 SOL and at least 10% of what they put in. Profit counts sells plus still-held tokens at today's price, holdings are verified on-chain, and only tokens they actually bought count. Losers are never listed. Full addresses are tap-to-copy, with their entry order and how much they still hold. One tap runs a Wallet Scan on any of them. Bundle and transfer wallets are hidden ("🚩 Hid N bundle/transfer wallets"); tap **🚩 Show flagged** to see them with the reason:
   - **dev wallet:** the coin's creator;
   - **bought in launch block:** bought in the creation block or the first trading block;
   - **same-block bundle:** 3+ wallets bought in one block with SOL amounts within ~10% of each other;

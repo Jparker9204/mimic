@@ -127,6 +127,19 @@ class Rpc:
             before = page[-1]["signature"]
         return out[:max_sigs]
 
+    async def token_balance(self, owner: str, mint: str) -> float | None:
+        """Current balance of `mint` held by `owner` (None if the RPC call failed)."""
+        params = [owner, {"mint": mint}, {"encoding": "jsonParsed"}]
+        for bucket, url in self.archive:          # PublicNode refuses this call without a personal token
+            ok, res = await self._call(bucket, url, "getTokenAccountsByOwner", params)
+            if ok:
+                total = 0.0
+                for acc in (res or {}).get("value") or []:
+                    info = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+                    total += float((info.get("tokenAmount") or {}).get("uiAmount") or 0)
+                return total
+        return None
+
     async def tx(self, sig: str, block_time: float | None = None) -> dict | None:
         key = "tx:" + sig
         hit = self.db.cache_get(key)

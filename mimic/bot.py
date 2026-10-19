@@ -65,7 +65,6 @@ class MimicBot:
         self.queue = JobQueue(config.MAX_HEAVY_JOBS)
         self.pay = Payments(self.db, self.limits.credits)
         self.watcher = PaymentWatcher(self.pay, PayRpc(self.net), self.on_pay_event)
-        self.pay_url_button: bool | None = None if config.PAY_TRY_URL_BUTTON else False
         self.app: Application | None = None
         self._watch_task: asyncio.Task | None = None
         if config.PAY_ADDRESS_INVALID:
@@ -354,7 +353,7 @@ class MimicBot:
             return
         log.info("admin %s granted %+d purchased credits to %s", uid, amount, target)
         await update.effective_message.reply_text(
-            f"✅ {amount:+d} purchased credits for <code>{target}</code>.\n"
+            f"✅ {amount:+d} purchased credit{'' if abs(amount) == 1 else 's'} for <code>{target}</code>.\n"
             + texts.balance_line(b, self.limits.credits), parse_mode=ParseMode.HTML)
 
     async def cmd_ledger(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -384,42 +383,25 @@ class MimicBot:
         return texts.buy_confirm_text(lamports), KB([[B("✅ Confirm", callback_data=f"buy:ok:{lamports}"),
                                                       B("✏️ Change", callback_data="buy")]])
 
-    def payment_kb(self, o, url_button: bool, copy: bool) -> KB:
-        rows = []
-        if url_button:
-            rows.append([B("💳 Pay with wallet", url=o.url)])
-        if copy:
-            rows.append([B("📋 Copy address", copy_text=CopyTextButton(o.recipient)),
-                         B("📋 Copy amount", copy_text=CopyTextButton(fmt_sol(o.lamports)))])
-            rows.append([B("📋 Copy Solana Pay link", copy_text=CopyTextButton(o.url))])
+    def payment_kb(self, o, copy: bool = True) -> KB:
+        rows = [[B("📋 Copy address", copy_text=CopyTextButton(o.recipient))]] if copy else []
         rows.append([B("✅ I've paid", callback_data=f"pay:chk:{o.id}"), B("✖️ Cancel", callback_data=f"pay:x:{o.id}")])
         return KB(rows)
 
     async def send_payment(self, bot, chat_id: int, o):
-        """QR code first, then the payment request with buttons. Telegram only allows http(s)/tg:// URL
-        buttons, so a 'Pay with wallet' button holding the solana: link is tried once and, if Telegram
-        rejects it, dropped for the rest of the process (the QR code and the copyable link remain)."""
+        """QR code (full solana: Solana Pay URL with the reference), then the short payment request.
+        If Telegram ever rejects the copy button, the message is sent without it."""
         try:
             await bot.send_photo(chat_id, qr_png(o.url), caption=texts.qr_caption(o))
         except TelegramError as e:
             log.warning("QR send failed: %s", e)
-        modes = ([(True, True)] if self.pay_url_button is not False else []) + [(False, True), (False, False)]
-        last = None
-        for url_button, copy in modes:
-            try:
-                msg = await bot.send_message(chat_id, texts.payment_text(o, url_button), parse_mode=ParseMode.HTML,
-                                             reply_markup=self.payment_kb(o, url_button, copy),
-                                             disable_web_page_preview=True)
-                if url_button and self.pay_url_button is None:
-                    self.pay_url_button = True
-                    log.info("Telegram accepted the solana: URL button")
-                return msg
-            except BadRequest as e:
-                last = e
-                log.warning("payment message rejected (url_button=%s copy=%s): %s", url_button, copy, e)
-                if url_button:
-                    self.pay_url_button = False
-        raise last
+        try:
+            return await bot.send_message(chat_id, texts.payment_text(o), parse_mode=ParseMode.HTML,
+                                          reply_markup=self.payment_kb(o), disable_web_page_preview=True)
+        except BadRequest as e:
+            log.warning("payment message rejected, retrying without the copy button: %s", e)
+            return await bot.send_message(chat_id, texts.payment_text(o), parse_mode=ParseMode.HTML,
+                                          reply_markup=self.payment_kb(o, copy=False), disable_web_page_preview=True)
 
     async def on_buy_button(self, update: Update, ctx, data: str) -> None:
         q, ud = update.callback_query, ctx.user_data
@@ -472,7 +454,7 @@ class MimicBot:
             return
         if data.startswith("pay:chk:"):
             if o.status == "paid":
-                await q.message.reply_text(f"✅ Order #{oid} is paid: +{o.credited} credits.", reply_markup=KB([home_row()]))
+                await q.message.reply_text(f"✅ Order #{oid} is paid: +{texts.cr(o.credited)}.", reply_markup=KB([home_row()]))
                 return
             last = ud.get("pay_chk", 0.0)
             if time.monotonic() - last < 5:

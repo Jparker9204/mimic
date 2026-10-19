@@ -214,7 +214,7 @@ def buy_text() -> str:
     p = config.PRICE_LAMPORTS
     return "\n".join([
         "💎 <b>Buy credits with SOL</b>",
-        f"Rate: <b>1 credit = {fmt_sol(p)} SOL</b> (1 SOL = {credits_for(10 ** 9, p)} credits)",
+        f"Rate: <b>1 credit = {fmt_sol(p)} SOL</b> (1 SOL = {cr(credits_for(10 ** 9, p))})",
         f"Minimum {fmt_sol(config.MIN_PURCHASE_LAMPORTS)} SOL · maximum {fmt_sol(config.MAX_PURCHASE_LAMPORTS)} SOL",
         "Bought credits never expire. Pick an amount:",
         "",
@@ -226,43 +226,31 @@ def buy_confirm_text(lamports: int) -> str:
     from . import config
     from .payments import credits_for, fmt_sol
     return "\n".join([
-        f"💎 <b>{fmt_sol(lamports)} SOL = {credits_for(lamports)} credits</b>",
+        f"💎 <b>{fmt_sol(lamports)} SOL = {cr(credits_for(lamports))}</b>",
         f"Next you'll get a payment request for exactly {fmt_sol(lamports)} SOL, valid for "
         f"{config.ORDER_TTL_S // 60} minutes. Nothing is charged until you send it from your wallet.",
     ])
 
 
-def payment_text(o, button: bool) -> str:
-    """The payment request (sent right after the QR code)."""
+def payment_text(o) -> str:
+    """The payment request (sent right after the QR code). Short on purpose."""
     from . import config
     from .payments import fmt_sol
-    amt = fmt_sol(o.lamports)
-    how = ("📱 <b>Phone:</b> tap <b>Pay with wallet</b> (opens Phantom/Solflare), or copy the address and amount "
-           "into your wallet's Send screen." if button else
-           "📱 <b>Phone:</b> copy the address and the amount into your wallet's Send screen (Phantom, Solflare…).")
     return "\n".join([
-        f"💎 <b>Pay {amt} SOL → get {o.credits} credits</b>",
+        f"💎 Buy {cr(o.credits)}",
         "",
-        f"Send exactly <b>{amt} SOL</b> to Mimic's wallet:",
+        f"Send exactly <b>{fmt_sol(o.lamports)} SOL</b> to:",
         f"<code>{o.recipient}</code>",
         "",
-        how,
-        "💻 <b>Computer:</b> scan the QR code above with your phone's wallet app.",
-        "Solana Pay link (paste into a wallet that supports it):",
-        f"<code>{html.escape(o.url)}</code>",
+        "Credits arrive about a minute after you pay. I'll message you.",
+        f"⏱ Expires in {config.ORDER_TTL_S // 60} min · Order #{o.id}",
         "",
-        f"⏱ Valid for {config.ORDER_TTL_S // 60} minutes. Credits arrive automatically about 30–60 seconds after "
-        "you pay, and I'll message you.",
-        "",
-        "🔒 This is a normal SOL transfer to Mimic's wallet. Mimic never asks for your seed phrase or to "
-        "connect your wallet.",
-        f"<i>Order #{o.id} · Non-refundable except failed checks or by admin decision. Not financial advice.</i>",
+        "🔒 Normal SOL transfer. Mimic never asks for your seed phrase or to connect your wallet.",
     ])
 
 
 def qr_caption(o) -> str:
-    from .payments import fmt_sol
-    return f"Scan with your wallet app to pay {fmt_sol(o.lamports)} SOL (order #{o.id})"
+    return "Scan with your wallet app"
 
 
 def tx_link(sig: str) -> str:
@@ -338,7 +326,7 @@ def credits_text(b, credits, user_id: int, now: float | None = None, admin: bool
     lines = [balance_line(b, credits, now, admin), "", "<b>Costs</b>"] + costs_lines() + [
         "🏆 Best &amp; worst trades, 📊 Sim trades, ⚙️ Filters: free",
         "",
-        f"🎁 You get <b>{credits.refill}</b> free credits every {hours:g}h, up to {credits.cap}.",
+        f"🎁 You get <b>{credits.refill}</b> free credit{'' if credits.refill == 1 else 's'} every {hours:g}h, up to {credits.cap}.",
         "Free credits are used first, then bought ones (bought credits never expire).",
         "If a check fails, its credits come back automatically.",
         buy_note(),
@@ -391,7 +379,7 @@ def help_text() -> str:
         "",
         "<b>💳 Credits</b>",
     ] + costs_lines() + [
-        f"🎁 {config.FREE_REFILL} free credits every {hours:g}h (up to {config.FREE_CAP}).",
+        f"🎁 {cr(config.FREE_REFILL).replace(' credit', ' free credit')} every {hours:g}h (up to {config.FREE_CAP}).",
         f"Failed checks are refunded automatically. Repeats within {config.CACHE_TTL_S // 60} min are fast but still cost credits.",
         f"There's a {config.COOLDOWN_S}s cooldown between checks.",
         "",

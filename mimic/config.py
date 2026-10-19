@@ -94,9 +94,6 @@ ORDER_TTL_S = max(60, _int("MIMIC_ORDER_MINUTES", 15) * 60)        # payment req
 LATE_PAYMENT_S = max(0, _int("MIMIC_LATE_PAYMENT_HOURS", 24) * 3600)   # still credit payments this long after creation
 PAY_CHECK_S = max(3, _int("MIMIC_PAY_CHECK_S", 10))                # open orders checked this often
 PAY_LATE_CHECK_S = max(10, _int("MIMIC_PAY_LATE_CHECK_S", 60))     # expired/cancelled unpaid orders
-# Telegram only accepts http(s)/tg:// URL buttons; the bot tries a solana: "Pay with wallet" button once
-# and falls back to QR + copyable link if Telegram rejects it. Set 0 to skip the attempt.
-PAY_TRY_URL_BUTTON = (os.getenv("MIMIC_PAY_URL_BUTTON") or "1").strip() != "0"
 PAY_TOLERANCE_LAMPORTS = 1000                                      # 0.000001 SOL
 
 COOLDOWN_S = _int("MIMIC_COOLDOWN_S", 25)

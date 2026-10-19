@@ -404,16 +404,14 @@ def test_env_pay_settings(monkeypatch):
 
 # ---------------------------------------------------------------- bot: screens and payment message
 class FakeTgBot:
-    def __init__(self, reject_url=True):
-        self.reject_url, self.photos, self.msgs = reject_url, [], []
+    def __init__(self):
+        self.photos, self.msgs = [], []
 
     async def send_photo(self, chat_id, photo, caption=None, **kw):
         self.photos.append((photo, caption))
 
     async def send_message(self, chat_id, text, reply_markup=None, **kw):
         btns = [b for row in reply_markup.inline_keyboard for b in row] if reply_markup else []
-        if self.reject_url and any(b.url and b.url.startswith("solana:") for b in btns):
-            raise BadRequest("Button_url_invalid")
         self.msgs.append((text, btns, kw))
         return object()
 
@@ -424,30 +422,50 @@ def mbot():
     return botmod.MimicBot(DB(":memory:"))
 
 
-async def test_payment_message_falls_back_without_url_button(mbot):
+EXPECTED_PAYMENT = (
+    "💎 Buy 50 credits\n\nSend exactly <b>0.05 SOL</b> to:\n<code>{addr}</code>\n\n"
+    "Credits arrive about a minute after you pay. I'll message you.\n⏱ Expires in 15 min · Order #{oid}\n\n"
+    "🔒 Normal SOL transfer. Mimic never asks for your seed phrase or to connect your wallet.")
+
+
+async def test_payment_message_is_short(mbot):
     o = mbot.pay.create(1, 1, 50_000_000, now=T0)
-    tg = FakeTgBot(reject_url=True)
+    tg = FakeTgBot()
     await mbot.send_payment(tg, 1, o)
-    assert mbot.pay_url_button is False
     text, btns, kw = tg.msgs[-1]
+    assert text == EXPECTED_PAYMENT.format(addr=ADDR, oid=o.id)
+    assert "solana:" not in text and "Phone" not in text and "refundable" not in text
     assert kw.get("disable_web_page_preview") is True
-    assert not any(b.url for b in btns)
-    assert {b.text for b in btns} >= {"📋 Copy address", "📋 Copy amount", "✅ I've paid", "✖️ Cancel"}
-    assert f"<code>{ADDR}</code>" in text and "0.05 SOL" in text and "50 credits" in text
-    assert "never asks for your seed phrase" in text and f"reference={o.reference}" in text
-    assert tg.photos[0][0][:4] == b"\x89PNG"
-    # next time the URL button isn't tried again
-    tg2 = FakeTgBot(reject_url=True)
-    await mbot.send_payment(tg2, 1, o)
-    assert len(tg2.msgs) == 1
+    assert [b.text for b in btns] == ["📋 Copy address", "✅ I've paid", "✖️ Cancel"]
+    assert btns[0].copy_text.text == ADDR and not any(b.url for b in btns)
+    png, caption = tg.photos[0]
+    assert png[:4] == b"\x89PNG" and caption == "Scan with your wallet app"
+    # the QR still encodes the full Solana Pay URL with the reference
+    assert o.url == f"solana:{ADDR}?amount=0.05&reference={o.reference}&label=Mimic&message=Mimic%20credits"
 
 
-async def test_payment_message_keeps_url_button_if_accepted(mbot):
+async def test_payment_message_without_copy_button_if_rejected(mbot):
+    class RejectCopy(FakeTgBot):
+        async def send_message(self, chat_id, text, reply_markup=None, **kw):
+            if any(b.copy_text for row in reply_markup.inline_keyboard for b in row):
+                raise BadRequest("copy_text not supported")
+            return await super().send_message(chat_id, text, reply_markup=reply_markup, **kw)
     o = mbot.pay.create(1, 1, 50_000_000, now=T0)
-    tg = FakeTgBot(reject_url=False)
+    tg = RejectCopy()
     await mbot.send_payment(tg, 1, o)
-    assert mbot.pay_url_button is True
-    assert tg.msgs[-1][1][0].url == o.url and "Pay with wallet" in tg.msgs[-1][0]
+    assert [b.text for b in tg.msgs[-1][1]] == ["✅ I've paid", "✖️ Cancel"]
+
+
+def test_singular_credit(mbot, monkeypatch):
+    monkeypatch.setattr(config, "MIN_PURCHASE_LAMPORTS", 1_000_000)
+    o = mbot.pay.create(1, 1, 1_000_000, now=T0)
+    assert texts.payment_text(o).startswith("💎 Buy 1 credit\n")
+    assert "0.001 SOL = 1 credit<" in texts.buy_confirm_text(1_000_000)
+    ev = pm.PayEvent("paid", o, "5" * 88, 1_000_000, credits=1)
+    assert "0.001 SOL → 1 credit. Tx:" in texts.paid_text(ev)
+    monkeypatch.setattr(config, "PRICE_LAMPORTS", SOL)
+    assert "(1 SOL = 1 credit)" in texts.buy_text()
+    assert texts.cr(1) == "1 credit" and texts.cr(2) == "2 credits"
 
 
 def test_buy_screen(mbot, monkeypatch):
@@ -488,7 +506,7 @@ def _update(data, log, uid=1):
 
 
 async def test_bot_buy_flow_confirm_check_cancel(mbot):
-    log, tg = [], FakeTgBot(reject_url=True)
+    log, tg = [], FakeTgBot()
     ctx = _Obj(bot=tg, user_data={})
     mbot.watcher.rpc = FakeRpc()
     mbot.watcher.scan_addr = False

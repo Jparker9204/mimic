@@ -57,7 +57,7 @@ def test_describe_lines():
     assert describe(PRESETS["whale"]) == "Filter: 🐳 Whale · put in ≥10 SOL · profit ≥5 SOL"
     assert describe(PRESETS["small"]) == "Filter: 🐟 Small · put in 0.05–1 SOL · profit ≥0.1 SOL"
     d = describe(Filter().set("max_rank", 50).set("holding", "holding").set("sort", "early").set("min_pct", 30))
-    assert d == ("Filter: ⚙️ Custom · put in ≥0.05 SOL · profit ≥0.1 SOL · profit ≥30% · first 50 buyers"
+    assert d == ("Filter: ⚙️ Custom · put in ≥0.05 SOL · profit ≥0.1 SOL · profit ≥30% · first 50 buyers checked"
                  " · still holding · sorted by earliest buyer")
 
 
@@ -71,15 +71,15 @@ def test_filter_saved_per_user():
 
 
 def res(cands):
-    return {"mint": "M" * 44, "sym": "WEFT", "sigs": 100, "txs": 100, "sampled": False, "price_sol": 0.02,
-            "candidates": cands, "flagged": [], "flagged_count": 0, "small": 0}
+    return {"mint": "M" * 44, "sym": "WEFT", "version": 2, "price_sol": 0.02, "priced": True, "launch_ts": 1000.0,
+            "checked": 38, "wanted": 40, "candidates": cands, "flagged": [], "flagged_count": 0, "small": 0}
 
 
 def test_text_has_filter_line_and_match_counts():
     out = texts.coin_scan_text(res(C), PRESETS["whale"])
     assert "Filter: 🐳 Whale · put in ≥10 SOL · profit ≥5 SOL" in out
     assert "Only 1 wallet matches this filter." in out
-    assert "No wallets match this filter" in texts.coin_scan_text(res([C[6]]), PRESETS["whale"])
+    assert "No checked wallets match this filter" in texts.coin_scan_text(res([C[6]]), PRESETS["whale"])
 
 
 async def test_refilter_uses_cache_only_no_api_no_check(monkeypatch):
@@ -90,9 +90,9 @@ async def test_refilter_uses_cache_only_no_api_no_check(monkeypatch):
         raise AssertionError("no API calls allowed when re-filtering")
     monkeypatch.setattr(b.net, "request", boom)
     r = res(C)
-    b.db.cache_set("coin4:" + r["mint"], r, 600)
+    b.db.cache_set("coin5:" + r["mint"], r, 600)
     b.db.set_setting(7, "coin_filter", PRESETS["mid"].to_dict())
-    text, kb = b.coin_view(b.db.cache_get("coin4:" + r["mint"]), b.get_filter(7))
+    text, kb = b.coin_view(b.db.cache_get("coin5:" + r["mint"]), b.get_filter(7))
     assert "🐬 Mid" in text and "mid1" in text and "whale1" not in text
     datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     assert "cflt:" + r["mint"] in datas and all(len(d) <= 64 for d in datas)
@@ -111,18 +111,10 @@ def test_filters_screen_buttons():
     assert "Filter: Any" in t
 
 
-def test_pick_for_verification_covers_every_preset():
-    from mimic.coinscan import pick_for_verification
-    cs = [dict(cand(f"w{i}", sol, 0.0, i), held_tokens=100.0, balance_ok=False)
-          for i, sol in enumerate([0.1] * 30 + [5.0] * 30 + [50.0] * 30)]
-    picked = pick_for_verification(cs, 0.05)
-    sizes = {x["sol_in"] for x in picked}
-    assert {0.1, 5.0, 50.0} <= sizes and len(picked) <= 40
-    assert pick_for_verification(cs, None) == []
-
-
-def test_buyer_rank_wording_when_launch_not_visible():
-    r = res(C)
-    assert "Bought: #40th buyer\n" in texts.coin_scan_text(r, PRESETS["whale"])
-    r["launch_checked"] = False
-    assert "Bought: #40th buyer in our sample" in texts.coin_scan_text(r, PRESETS["whale"])
+def test_bought_time_after_launch():
+    r = res([dict(C[0], first_t=1000.0 + 2 * 3600 + 5 * 60)])
+    out = texts.coin_scan_text(r, PRESETS["whale"])
+    assert "Bought: 2h 5m after launch" in out
+    assert "Checked 38 of 40 wallets" in out
+    r["launch_ts"] = None
+    assert "Bought: " in texts.coin_scan_text(r, PRESETS["whale"])

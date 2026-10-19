@@ -68,5 +68,7 @@ python3.10 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 ## Limitations
 - **Scan coverage:** the free RPCs are slow. A wallet scan reads at most 800 transactions within a time budget, newest first, and tells you when it could only cover part of the 14 days.
 - **Peak hit rates:** these use 15-min candles that start after the buy, so the first minutes of a pump are skipped (this understates the hit rate). Only the 40 newest coins are charted per scan.
-- **Coin Scan:** for big coins it samples the earliest and newest trades, so the profits shown are approximate.
+- **Coin Scan (v2, per-wallet):** it picks about 40 wallets (top 20 holders plus the biggest recent traders from GeckoTerminal) and reads each wallet's **own** token-account history for that coin. A wallet's profit is only shown after its whole history on the coin has been read. Wallets with more than 40 trades on the coin are skipped as bots. Wallets that sold out before the newest ~300 pool trades and aren't top holders can be missed. Trades paid in WBTC, USDC, or another pair's quote token are valued at today's price of that token.
+- **Top holders** (`getTokenLargestAccounts`) are refused by every public RPC we tried. Without `MIMIC_RPC_URL` Mimic tries Alchemy's public demo endpoint, which is often rate-limited, and then says "Top-holder list was unavailable". **A free Helius key is strongly recommended**: it gives reliable top holders and faster history reads.
+- **Rate limits are never hidden:** if most reads fail, the check stops with "data source busy, try again" and doesn't count.
 - **Past results don't predict the future.** This is not financial advice.

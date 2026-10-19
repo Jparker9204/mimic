@@ -4,7 +4,7 @@ Fix vs the old wallet watcher: transactions are requested with
 maxSupportedTransactionVersion=1 so newer-format swaps are no longer skipped.
 """
 from __future__ import annotations
-import asyncio, time
+import asyncio, hashlib, time
 from . import config
 from .db import DB
 from .net import Net
@@ -14,6 +14,62 @@ STABLES = {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 TX_CACHE_TTL = 20 * 86400
 MAX_TX_VERSION = 1
+
+
+TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+SYSTEM_PROGRAM = "11111111111111111111111111111111"
+# Public demo endpoint; used ONLY as a fallback for getTokenLargestAccounts, which the public
+# mainnet RPC rate-limits almost permanently. Set MIMIC_RPC_URL to avoid relying on it.
+DEMO_HOLDERS_RPC = "https://solana-mainnet.g.alchemy.com/v2/demo"
+
+
+class DataBusy(Exception):
+    """Free data sources rate-limited us: the result would be misleading, so don't show (or count) it."""
+
+
+def b58encode(b: bytes) -> str:
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = B58[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\0"))) + out
+
+
+_P = 2 ** 255 - 19
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+
+
+def _on_curve(b: bytes) -> bool:
+    """Is this 32-byte string a valid ed25519 point (i.e. NOT usable as a PDA)?"""
+    y = int.from_bytes(b, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return False
+    y2 = y * y % _P
+    u, v = (y2 - 1) % _P, (_D * y2 + 1) % _P
+    x2 = u * pow(v, _P - 2, _P) % _P
+    if x2 == 0:
+        return True
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P:
+        x = x * pow(2, (_P - 1) // 4, _P) % _P
+    return (x * x - x2) % _P == 0
+
+
+def find_pda(seeds: list[bytes], program: str) -> str:
+    prog = b58decode(program)
+    for bump in range(255, -1, -1):
+        h = hashlib.sha256(b"".join(seeds) + bytes([bump]) + prog + b"ProgramDerivedAddress").digest()
+        if not _on_curve(h):
+            return b58encode(h)
+    raise ValueError("no PDA")
+
+
+def ata_address(owner: str, mint: str, token_program: str = TOKEN_PROGRAM) -> str:
+    """The wallet's associated token account for this mint (exists in history even after it's closed)."""
+    return find_pda([b58decode(owner), b58decode(token_program), b58decode(mint)], ATA_PROGRAM)
 
 
 def b58decode(s: str) -> bytes:
@@ -89,14 +145,54 @@ def parse_swap(red: dict, wallet: str):
 class Rpc:
     def __init__(self, net: Net, db: DB):
         self.net, self.db = net, db
+        self.ok = self.fail = 0
         self.archive = ([("custom", config.CUSTOM_RPC)] if config.CUSTOM_RPC else []) + [("mainnet", config.MAINNET_RPC)]
         self.recent = ([("custom", config.CUSTOM_RPC)] if config.CUSTOM_RPC else []) + [("publicnode", config.PUBLICNODE_RPC)]
 
-    async def _call(self, bucket: str, url: str, method: str, params: list):
-        j = await self.net.request(bucket, "POST", url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    async def _call(self, bucket: str, url: str, method: str, params: list, retries: int = 4):
+        j = await self.net.request(bucket, "POST", url, retries=retries,
+                                   json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
         if isinstance(j, dict) and "result" in j:
+            self.ok += 1
             return True, j["result"]
+        self.fail += 1
         return False, None
+
+    async def call(self, method: str, params: list, order: list[tuple[str, str, int]] | None = None):
+        """Try endpoints in order [(bucket, url, retries)]; default = full-history ones. Raises DataBusy."""
+        if order is None:
+            order = [(b, u, 4) for b, u in self.archive]
+        for bucket, url, retries in order:
+            ok, res = await self._call(bucket, url, method, params, retries=retries)
+            if ok:
+                return res
+        raise DataBusy(method)
+
+    def _state_order(self) -> list[tuple[str, str, int]]:
+        """Current-state calls (balances, account owners): any healthy node works, PublicNode is fast."""
+        return ([("custom", config.CUSTOM_RPC, 3)] if config.CUSTOM_RPC else []) + [
+            ("publicnode", config.PUBLICNODE_RPC, 2), ("mainnet", config.MAINNET_RPC, 2)]
+
+    async def account_info(self, address: str) -> dict | None:
+        res = await self.call("getAccountInfo", [address, {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0}}],
+                              order=self._state_order())
+        return (res or {}).get("value")
+
+    async def largest_holders(self, mint: str) -> list[str]:
+        """Token account addresses of the top ~20 holders. Public mainnet almost always 429s this call,
+        so without a custom RPC we use Alchemy's public demo endpoint first and don't wait on mainnet."""
+        order = ([("custom", config.CUSTOM_RPC, 3)] if config.CUSTOM_RPC else []) + [
+            ("demo", DEMO_HOLDERS_RPC, 2), ("mainnet", config.MAINNET_RPC, 0)]
+        res = await self.call("getTokenLargestAccounts", [mint], order=order)
+        return [a["address"] for a in (res or {}).get("value") or []]
+
+    async def accounts(self, addresses: list[str], parsed: bool = True) -> list[dict | None]:
+        out: list[dict | None] = []
+        for i in range(0, len(addresses), 100):
+            cfg = {"encoding": "jsonParsed"} if parsed else {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0}}
+            res = await self.call("getMultipleAccounts", [addresses[i:i + 100], cfg], order=self._state_order())
+            out += (res or {}).get("value") or [None] * len(addresses[i:i + 100])
+        return out
 
     async def signatures(self, address: str, since_ts: float, max_sigs: int) -> list[dict]:
         """Newest-first signatures down to `since_ts` (or max_sigs)."""
@@ -171,10 +267,11 @@ class Rpc:
         results: list[tuple[dict, dict] | None] = [None] * len(sigs)
         idx = 0
         done = 0
+        failed = 0
         lock = asyncio.Lock()
 
         async def worker():
-            nonlocal idx, done
+            nonlocal idx, done, failed
             while True:
                 async with lock:
                     if idx >= len(sigs) or time.monotonic() > deadline:
@@ -189,6 +286,8 @@ class Rpc:
                     red = None
                 if red:
                     results[i] = (s, red)
+                else:
+                    failed += 1
                 done += 1
                 if progress and done % 25 == 0:
                     await progress(done, len(sigs))
@@ -196,4 +295,15 @@ class Rpc:
         await asyncio.gather(*(worker() for _ in range(concurrency)))
         # keep only the contiguous newest prefix that was attempted, so coverage is a clean time window
         attempted = min(idx, len(sigs))
+        self.last_batch = {"wanted": len(sigs), "attempted": attempted, "failed": failed}
         return [r for r in results[:attempted] if r]
+
+    def check_batch(self, min_attempts: int = 10, max_fail: float = 0.5) -> None:
+        """Raise DataBusy if the last many_tx mostly failed or barely got started (rate limited)."""
+        b = getattr(self, "last_batch", None)
+        if not b or not b["wanted"]:
+            return
+        if b["attempted"] >= min_attempts and b["failed"] > max_fail * b["attempted"]:
+            raise DataBusy(f"{b['failed']} of {b['attempted']} transactions failed")
+        if b["attempted"] - b["failed"] < min(min_attempts, b["wanted"]):
+            raise DataBusy(f"only {b['attempted'] - b['failed']} of {b['wanted']} transactions read")

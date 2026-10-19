@@ -44,6 +44,33 @@ class Market:
                 self.db.cache_set("ds:" + m, {"v": out[m]}, 30 * 60)
         return out
 
+    async def pairs(self, mint: str) -> list[dict]:
+        """All DexScreener pairs for a token (raw), most liquid first. Cached 10 min."""
+        hit = self.db.cache_get("dspairs:" + mint)
+        if hit is not None:
+            return hit
+        j = await self.net.request("dex", "GET", "https://api.dexscreener.com/tokens/v1/solana/" + mint)
+        if j is None:
+            return []
+        out = sorted((p for p in j or [] if (p.get("baseToken") or {}).get("address") == mint),
+                     key=lambda p: -float((p.get("liquidity") or {}).get("usd") or 0))
+        self.db.cache_set("dspairs:" + mint, out, 600)
+        return out
+
+    async def pool_trades(self, pool: str, min_usd: float = 0) -> list[dict]:
+        """Up to 300 recent trades on a pool (GeckoTerminal, free). [{wallet, kind, usd, t, sig}]"""
+        q = f"?trade_volume_in_usd_greater_than={min_usd:g}" if min_usd else ""
+        j = await self.net.request("gecko", "GET", f"{GT}/pools/{pool}/trades{q}")
+        out = []
+        try:
+            for d in j["data"]:
+                a = d["attributes"]
+                out.append({"wallet": a.get("tx_from_address"), "kind": a.get("kind"),
+                            "usd": float(a.get("volume_in_usd") or 0), "sig": a.get("tx_hash")})
+        except (TypeError, KeyError):
+            return []
+        return [x for x in out if x["wallet"]]
+
     async def pool_for(self, mint: str, dex: dict | None) -> str | None:
         if dex and dex.get("pair"):
             return dex["pair"]

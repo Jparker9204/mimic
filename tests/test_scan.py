@@ -1,4 +1,3 @@
-from mimic.coinscan import pick_sigs
 from mimic.market import SolPrice
 from mimic.scan import build_positions, copyability, peak_after, summarize
 
@@ -30,14 +29,3 @@ def test_copyability_notes():
     assert "Copyable" in copyability(76, 5)
     assert "Tricky" in copyability(5, 1)
     assert "unknown" in copyability(None, 1)
-
-
-def test_pick_sigs_sampling():
-    sigs = [{"signature": str(i)} for i in range(1000)]   # newest first
-    chosen, sampled = pick_sigs(sigs, 100)
-    assert sampled and len(chosen) == 100
-    assert chosen[0]["signature"] == "999"            # oldest (launch) first
-    assert {"0", "940"} <= {c["signature"] for c in chosen}
-    assert pick_sigs(sigs[:50], 100) == (list(reversed(sigs[:50])), False)
-
-

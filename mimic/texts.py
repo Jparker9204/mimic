@@ -79,44 +79,65 @@ def sim_text(wallet: str, label: str, summ: dict, delay_s: int = 15) -> str:
     return "\n".join(lines)
 
 
+def ago(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h {s % 3600 // 60}m"
+    return f"{s // 86400}d {s % 86400 // 3600}h"
+
+
 def coin_scan_text(res: dict, flt=None) -> str:
     from .filters import Filter, apply_filter, describe
     flt = flt or Filter()
     rows_data, total = apply_filter(res.get("candidates") or [], flt, res.get("price_sol"))
     head = (f"🪙 <b>Coin Scan · {html.escape(res['sym'])}</b>\n{addr(res['mint'])}\n"
             f"<i>{html.escape(describe(flt))}</i>\n<b>Top traders</b>")
-    rank_note = "" if res.get("launch_checked", True) else " in our sample"
     rows = []
+    launch = res.get("launch_ts")
     for i, t in enumerate(rows_data, 1):
+        if launch and t.get("first_t"):
+            bought = f"{ago(t['first_t'] - launch)} after launch"
+        elif t.get("first_t"):
+            bought = time.strftime("%b %d %H:%M UTC", time.gmtime(t["first_t"]))
+        else:
+            bought = "unknown"
         rows += [f"{i}. Profit: <b>{t['profit_sol']:+.2f} SOL ({t['profit_pct']:+d}%)</b>",
                  f"   Put in: {t['sol_in']:.2f} SOL · Still holding: {t['holding_pct']}%",
-                 f"   Bought: #{ordinal(t['entry_rank'])} buyer{rank_note}",
+                 f"   Bought: {bought}",
                  f"   {addr(t['wallet'])}", ""]
     default = flt.preset == "any"
     if total == 0:
-        rows = ["No wallet made real profit on this coin (at least 0.1 SOL and 10%)." if default
-                else "No wallets match this filter. Try ⚙️ Filters.", ""]
+        rows = ["No checked wallet made real profit on this coin (at least 0.1 SOL and 10%)." if default
+                else "No checked wallets match this filter. Try ⚙️ Filters.", ""]
     elif total < 10:
         rows.append(f"Only {total} wallet{'s' if total != 1 else ''} "
                     + ("made real profit on this coin." if default else ("match" if total != 1 else "matches")
                        + " this filter."))
     elif total > 10:
         rows.append(f"Showing top 10 of {total} matching wallets.")
-    extra = []
+    extra = [f"🔎 Checked {res.get('checked', 0)} of {res.get('wanted', 0)} wallets "
+             f"(top holders + recent big traders), each with its full history on this coin."]
     if res.get("flagged_count"):
         extra.append(f"🚩 Hid {res['flagged_count']} bundle/transfer wallet{'s' if res['flagged_count'] != 1 else ''}")
-    if res.get("small") and default:
-        extra.append(f"🤏 Skipped {res['small']} tiny buyers (under 0.05 SOL)")
+    skipped = []
+    if res.get("very_active"):
+        skipped.append(f"{res['very_active']} very active (bots?)")
+    if res.get("unchecked") or res.get("history_failed"):
+        skipped.append(f"{res.get('unchecked', 0) + res.get('history_failed', 0)} not read in time")
+    if res.get("unvalued"):
+        skipped.append(f"{res['unvalued']} paid with tokens we can't price")
+    if skipped:
+        extra.append("⏭ Skipped: " + ", ".join(skipped))
+    if res.get("holders_failed"):
+        extra.append("<i>Top-holder list was unavailable, so only recent traders were checked.</i>")
     if not res.get("priced", True):
         extra.append("<i>No current price, so profit counts sells only.</i>")
-    if not res.get("launch_checked", True):
-        extra.append("<i>Too many trades to see the launch, so buyer numbers count from the oldest trade we could read "
-                     "and the launch-block check was skipped.</i>")
-    big = f" + {res['big_trades_added']} recent big trades" if res.get("big_trades_added") else ""
-    note = (f"<i>Based on {res['txs']} of {res['sigs']}{'+' if res['sigs'] >= res.get('sig_cap', 5000) else ''} trades "
-            f"(earliest + newest{big}), so it's approximate and can miss some whales.</i>"
-            if res["sampled"] else f"<i>Based on all {res['txs']} trades.</i>")
-    return "\n".join([head, ""] + rows + extra + [note])
+    extra.append("<i>Wallets that sold out before today's trades may be missed.</i>")
+    return "\n".join([head, ""] + rows + extra)
 
 
 def flagged_text(res: dict) -> str:

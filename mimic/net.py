@@ -12,6 +12,7 @@ INTERVALS = {
     "publicnode": 0.06,
     "mainnet": 0.3,     # api.mainnet-beta: ~40 calls/10s per method
     "custom": 0.08,
+    "demo": 1.0,
 }
 
 

@@ -65,7 +65,7 @@ def describe(f: Filter) -> str:
     if f.min_pct != 10:
         parts.append(f"profit ≥{_n(f.min_pct)}%")
     if f.max_rank:
-        parts.append(f"first {f.max_rank} buyers")
+        parts.append(f"first {f.max_rank} buyers checked")
     if f.holding != "any":
         parts.append(HOLDING_NAMES[f.holding])
     if f.sort != "profit":

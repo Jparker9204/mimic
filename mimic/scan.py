@@ -104,6 +104,8 @@ async def wallet_scan(svc: Services, wallet: str, progress=None, days: int | Non
         if progress:
             await progress(f"📜 Reading trades… {done}/{total}")
     got = await svc.rpc.many_tx(to_fetch, config.TX_BUDGET_S, progress=txprog)
+    if to_fetch:
+        svc.rpc.check_batch(min_attempts=min(10, len(to_fetch)))     # rate limited -> DataBusy, not a fake result
     covered_from = min((s.get("blockTime") or now) for s, _ in got) if got else now
     capped = len(got) < len(sigs)
     swaps = []

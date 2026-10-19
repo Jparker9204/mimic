@@ -1,66 +1,102 @@
-"""Coin Scan: who traded this coin, ranked by realized profit, with bundle/transfer wallets filtered out.
+"""Coin Scan v2: per-wallet PnL on one coin.
 
-Flags (wallet is hidden from the ranking and listed under "Show flagged"):
-- dev:        the wallet that created the coin
-- launch:     bought in the creation block or in the very first trading block (snipers/bundles)
-- cluster:    3+ wallets bought in the same block with near-identical SOL amounts
-- transfer:   got a big share of its tokens by transfer instead of buying
-- from dev:   received tokens directly from the dev wallet
-- no buy:     spent < 0.01 SOL in total (tokens came from somewhere else)
-Unflagged wallets that spent < 0.05 SOL are not ranked either (too small to matter).
+1. Candidates: top ~20 holders (getTokenLargestAccounts, real wallets only) + recent big/active traders
+   from GeckoTerminal pool trades. Capped at ~40.
+2. For each candidate, read the history of THEIR token account for this coin (small, complete even on
+   busy coins), value every buy/sell in SOL (SOL, WSOL, stables and the pair's quote token), and add the
+   current holding at today's price.
+3. Flag bundle/transfer/launch-block wallets; rank real winners with the user's filter (see filters.py).
+If the free data sources rate-limit us, raise DataBusy instead of returning a misleading "no profit".
 """
 from __future__ import annotations
-import time
+import asyncio
+import logging, time
 from collections import defaultdict
 from . import config
 from .market import SolPrice
 from .scan import Services
-from .solana import STABLES, WSOL, parse_swap
+from .solana import (STABLES, SYSTEM_PROGRAM, TOKEN_PROGRAM, WSOL, DataBusy, ata_address)
 
-MIN_REAL_SOL = 0.05     # rank only traders who put in at least this much
-MIN_PROFIT_SOL = 0.1    # "real profit" = at least this much SOL...
-MIN_PROFIT_PCT = 0.10   # ...and at least 10% of what they put in
-LARGE_TRADE_USD = 1000.0
-LARGE_TRADE_MAX = 120
-VERIFY_PER_PRESET = 15
-VERIFY_MAX = 40
+log = logging.getLogger(__name__)
+
+MIN_REAL_SOL = 0.05     # only traders who put in at least this much are kept as candidates
 NO_BUY_SOL = 0.01       # below this, the wallet basically didn't buy
-CLUSTER_MIN = 3         # wallets in one block with similar size
-CLUSTER_SPREAD = 1.10   # max/min SOL ratio inside a cluster
-TRANSFER_SHARE = 0.5    # transferred-in tokens >= 50% of bought tokens
+CLUSTER_MIN = 3
+CLUSTER_SPREAD = 1.10
+TRANSFER_SHARE = 0.5
+LAUNCH_WINDOW_S = 2     # first buy within 2s of the pool's creation = launch block
+MAX_CANDIDATES = 40
+MAX_HOLDERS = 20
+PER_WALLET_MAX_TX = 40  # wallets with more trades on this coin are bots; skipped (history too long)
+BUDGET_S = 75           # time budget for reading wallet histories
 
-REASONS = {"dev": "dev wallet", "launch": "bought in launch block", "cluster": "same-block bundle",
-           "transfer": "got tokens by transfer", "from_dev": "got tokens from dev", "no_buy": "no real buy (under 0.01 SOL)"}
+REASONS = {"launch": "bought in launch block", "cluster": "same-block bundle", "transfer": "got tokens by transfer",
+           "no_buy": "no real buy (under 0.01 SOL)"}
 
 
-def extract_events(got: list[tuple[dict, dict]], mint: str) -> tuple[list[dict], list[dict]]:
-    """From reduced txs, the swaps by the fee payer and token transfers of `mint`.
-    A tx without a payer swap that moves the coin is treated as a transfer: owners whose balance
-    went up are receivers, owners whose balance went down are senders."""
-    swaps, transfers = [], []
-    for s, red in got:
-        t = red.get("t") or s.get("blockTime") or 0
-        slot = s.get("slot") or 0
-        who = red.get("payer")
-        sw = parse_swap(red, who) if who else None
-        if sw and sw[1] == mint:
-            swaps.append({"t": t, "slot": slot, "who": who, "side": sw[0], "q": sw[2], "sol": sw[3], "sig": s["signature"]})
+# ------------------------------------------------------------------ pure helpers (tested)
+def classify(red: dict, wallet: str, mint: str, value_sol: dict[str, float]) -> tuple[str, float, float] | None:
+    """What did `wallet` do with `mint` in this tx? -> (kind, tokens, sol_value)
+    kind: BUY / SELL / XFER_IN / XFER_OUT / UNKNOWN (paid with a token we can't price)."""
+    if not red or red.get("err"):
+        return None
+    d = dict(red["tok"].get(wallet) or {})
+    q = d.pop(mint, 0.0)
+    if abs(q) < 1e-12:
+        return None
+    sol = red["sol"].get(wallet, 0.0) + d.pop(WSOL, 0.0)
+    for tok, delta in d.items():
+        if abs(delta) < 1e-9:
             continue
-        if red.get("err"):
-            continue
-        deltas = {o: d.get(mint, 0.0) for o, d in (red.get("tok") or {}).items() if abs(d.get(mint, 0.0)) > 1e-9}
-        senders = [o for o, v in deltas.items() if v < 0]
-        for o, v in deltas.items():
-            if v > 0:
-                transfers.append({"t": t, "slot": slot, "to": o, "from": senders, "q": v})
-    return swaps, transfers
+        v = value_sol.get(tok)
+        if v is None:
+            return ("UNKNOWN", abs(q), 0.0)
+        sol += delta * v
+    if q > 0:
+        return ("BUY", q, -sol) if sol < -0.001 else ("XFER_IN", q, 0.0)
+    return ("SELL", -q, sol) if sol > 0.0005 else ("XFER_OUT", -q, 0.0)
 
 
-def find_clusters(swaps: list[dict]) -> set[str]:
+def wallet_pnl(wallet: str, events: list[tuple[float, int, tuple]], balance: float) -> dict:
+    """events: [(time, slot, (kind, tokens, sol))]. Average-cost PnL on tokens the wallet actually bought."""
+    x = {"wallet": wallet, "buys": 0, "sells": 0, "sol_in": 0.0, "sol_out": 0.0, "tok_in": 0.0, "tok_out": 0.0,
+         "xfer_in": 0.0, "xfer_out": 0.0, "unknown": 0, "first_t": None, "first_slot": None, "first_sol": 0.0}
+    for t, slot, (kind, q, s) in sorted(events, key=lambda e: (e[1], e[0])):
+        if kind == "BUY":
+            if x["first_t"] is None:
+                x["first_t"], x["first_slot"], x["first_sol"] = t, slot, s
+            x["buys"] += 1
+            x["sol_in"] += s
+            x["tok_in"] += q
+        elif kind == "SELL":
+            x["sells"] += 1
+            x["sol_out"] += s
+            x["tok_out"] += q
+        elif kind == "XFER_IN":
+            x["xfer_in"] += q
+        elif kind == "XFER_OUT":
+            x["xfer_out"] += q
+        else:
+            x["unknown"] += 1
+    bought_sold = min(x["tok_out"], x["tok_in"])
+    sold_frac = bought_sold / x["tok_in"] if x["tok_in"] else 0.0
+    proceeds = x["sol_out"] * (bought_sold / x["tok_out"]) if x["tok_out"] else 0.0
+    x["realized_sol"] = round(proceeds - x["sol_in"] * sold_frac, 4)
+    unsold = max(0.0, x["tok_in"] - bought_sold)
+    held = min(max(balance, 0.0), unsold)
+    x["held_tokens"] = held
+    x["held_cost_sol"] = x["sol_in"] * (held / x["tok_in"]) if x["tok_in"] else 0.0
+    x["holding_pct"] = round(100 * held / x["tok_in"]) if x["tok_in"] else 0
+    x["balance_ok"] = True          # balance comes straight from the chain
+    return x
+
+
+def find_clusters(first_buys: list[tuple[int, float, str]]) -> set[str]:
+    """first_buys: [(slot, sol, wallet)]. 3+ wallets whose first buy is in one block with similar size."""
     by_slot: dict[int, list[tuple[float, str]]] = defaultdict(list)
-    for e in swaps:
-        if e["side"] == "BUY" and e["slot"]:
-            by_slot[e["slot"]].append((e["sol"], e["who"]))
+    for slot, sol, w in first_buys:
+        if slot:
+            by_slot[slot].append((sol, w))
     flagged: set[str] = set()
     for buys in by_slot.values():
         if len({w for _, w in buys}) < CLUSTER_MIN:
@@ -76,197 +112,186 @@ def find_clusters(swaps: list[dict]) -> set[str]:
     return flagged
 
 
-def aggregate_traders(swaps: list[dict], transfers: list[dict] | None = None, *, dev: str | None = None,
-                      launch_slots: set[int] | None = None) -> tuple[list[dict], list[dict], int]:
-    """Returns (ranked real traders, flagged wallets, number of small unflagged buyers).
-    Realized profit only counts the tokens the wallet actually bought (average cost);
-    proceeds from selling transferred-in tokens are ignored."""
-    transfers = transfers or []
-    launch_slots = launch_slots or set()
-    tr: dict[str, dict] = {}
-    order = 0
+def flag_wallets(rows: list[dict], launch_ts: float | None) -> None:
+    clusters = find_clusters([(r["first_slot"], r["first_sol"], r["wallet"]) for r in rows if r["first_slot"]])
+    for r in rows:
+        f = set()
+        if r["sol_in"] < NO_BUY_SOL and (r["sells"] or r["xfer_in"]):
+            f.add("no_buy")
+        if r["xfer_in"] > 0 and r["xfer_in"] >= TRANSFER_SHARE * max(r["tok_in"], 1e-12):
+            f.add("transfer")
+        if launch_ts and r["first_t"] and r["first_t"] - launch_ts <= LAUNCH_WINDOW_S:
+            f.add("launch")
+        if r["wallet"] in clusters:
+            f.add("cluster")
+        r["flags"] = sorted(f)
+        r["reasons"] = [REASONS[k] for k in r["flags"]]
 
-    def get(w):
-        return tr.setdefault(w, {"wallet": w, "buys": 0, "sells": 0, "sol_in": 0.0, "sol_out": 0.0, "tok_in": 0.0,
-                                 "tok_out": 0.0, "tok_xfer_in": 0.0, "first_t": None, "first_slot": None,
-                                 "entry_rank": None, "flags": set()})
-    for e in sorted(swaps, key=lambda x: (x["slot"], x["t"])):
-        x = get(e["who"])
-        if e["side"] == "BUY":
-            if x["entry_rank"] is None:
-                order += 1
-                x["entry_rank"], x["first_t"], x["first_slot"] = order, e["t"], e["slot"]
-            x["buys"] += 1
-            x["sol_in"] += e["sol"]
-            x["tok_in"] += e["q"]
-            if e["slot"] in launch_slots:
-                x["flags"].add("launch")
-        else:
-            x["sells"] += 1
-            x["sol_out"] += e["sol"]
-            x["tok_out"] += e["q"]
-    for e in transfers:
-        if e["to"] not in tr:      # receivers that never traded don't matter for the ranking
+
+def merge_candidates(holders: list[tuple[str, str]], trades: list[dict], cap: int = MAX_CANDIDATES,
+                     exclude: set[str] | None = None) -> list[tuple[str, str | None, str]]:
+    """-> [(wallet, token_account or None, source)] holders first, then traders by USD volume."""
+    exclude = exclude or set()
+    out: dict[str, tuple[str, str | None, str]] = {}
+    for w, acc in holders[:MAX_HOLDERS]:
+        if w not in exclude:
+            out.setdefault(w, (w, acc, "holder"))
+    vol: dict[str, float] = defaultdict(float)
+    for t in trades:
+        vol[t["wallet"]] += t["usd"]
+    for w in sorted(vol, key=lambda k: -vol[k]):
+        if len(out) >= cap:
+            break
+        if w not in exclude:
+            out.setdefault(w, (w, None, "trader"))
+    return list(out.values())[:cap]
+
+
+def quote_values(pairs: list[dict], sol_usd: float) -> dict[str, float]:
+    """SOL value of one unit of each token we can price: stables and the pairs' quote tokens."""
+    v = {s: 1.0 / sol_usd for s in STABLES}
+    for p in pairs:
+        q = (p.get("quoteToken") or {}).get("address")
+        try:
+            pu, pn = float(p.get("priceUsd") or 0), float(p.get("priceNative") or 0)
+        except (TypeError, ValueError):
             continue
-        x = tr[e["to"]]
-        x["tok_xfer_in"] += e["q"]
-        if dev and dev in e["from"] and e["to"] != dev:
-            x["flags"].add("from_dev")
-    for w in find_clusters(swaps):
-        tr[w]["flags"].add("cluster")
-    if dev and dev in tr:
-        tr[dev]["flags"].add("dev")
-
-    ranked, flagged, small = [], [], 0
-    for x in tr.values():
-        if x["sol_in"] < NO_BUY_SOL and (x["sells"] or x["tok_xfer_in"]):
-            x["flags"].add("no_buy")
-        if x["tok_xfer_in"] > 0 and x["tok_xfer_in"] >= TRANSFER_SHARE * max(x["tok_in"], 1e-12):
-            x["flags"].add("transfer")
-        bought_sold = min(x["tok_out"], x["tok_in"])
-        sold_frac = bought_sold / x["tok_in"] if x["tok_in"] else 0.0
-        proceeds = x["sol_out"] * (bought_sold / x["tok_out"]) if x["tok_out"] else 0.0
-        x["realized_sol"] = round(proceeds - x["sol_in"] * sold_frac, 4)
-        x["holding_pct"] = round(100 * (1 - sold_frac)) if x["tok_in"] else 0
-        x["held_tokens"] = max(0.0, x["tok_in"] - bought_sold)
-        x["held_cost_sol"] = x["sol_in"] * (1 - sold_frac)
-        x["flags"] = sorted(x["flags"])
-        x["reasons"] = [REASONS[f] for f in x["flags"]]
-        if x["flags"]:
-            flagged.append(x)
-        elif x["sol_in"] >= MIN_REAL_SOL:
-            ranked.append(x)
-        elif x["tok_in"]:
-            small += 1
-    ranked.sort(key=lambda x: (x["sells"] == 0, -x["realized_sol"] if x["sells"] else -x["sol_in"]))
-    flagged.sort(key=lambda x: -(x["sol_out"] + x["sol_in"]))
-    return ranked, flagged, small
+        if q and q != WSOL and q not in v and pu > 0 and pn > 0:
+            v[q] = (pu / pn) / sol_usd
+    return v
 
 
-def apply_balance(x: dict, balance: float | None) -> None:
-    """Trust the on-chain balance over our sampled history: if the wallet now holds fewer tokens than we
-    think, it sold/moved them in trades we didn't read. That part is treated as sold at cost (no gain)."""
-    if balance is None or x.get("held_tokens", 0.0) <= 0:
-        return
-    x["balance_ok"] = True
-    held = x["held_tokens"]
-    actual = min(balance, held)
-    if actual < held:
-        x["held_cost_sol"] *= actual / held if held else 0.0
-        x["held_tokens"] = actual
-        x["holding_pct"] = round(100 * actual / x["tok_in"]) if x["tok_in"] else 0
-        x["balance_checked"] = True
-
-
-def unrealized(x: dict, price_sol: float | None, require_verified: bool = False) -> float:
-    if not price_sol or x.get("held_tokens", 0.0) <= 0:
-        return 0.0
-    if require_verified and not x.get("balance_ok"):
-        return 0.0                      # holding not confirmed on-chain: count sells only
-    return x["held_tokens"] * price_sol - x.get("held_cost_sol", 0.0)
-
-
-def estimate_profit(x: dict, price_sol: float | None) -> float:
-    return x["realized_sol"] + unrealized(x, price_sol)
-
-
-def pick_for_verification(ranked: list[dict], price_sol: float | None) -> list[dict]:
-    """Union of the likely top wallets (by estimated profit) inside each preset's size range."""
-    if not price_sol:
-        return []
-    from .filters import PRESETS
-    holders = sorted((x for x in ranked if x.get("held_tokens", 0) > 0), key=lambda x: -estimate_profit(x, price_sol))
-    picked: dict[str, dict] = {}
-    for f in PRESETS.values():
-        n = 0
-        for x in holders:
-            if x["sol_in"] < f.min_in or (f.max_in is not None and x["sol_in"] > f.max_in):
-                continue
-            picked.setdefault(x["wallet"], x)
-            n += 1
-            if n >= VERIFY_PER_PRESET:
-                break
-    return list(picked.values())[:VERIFY_MAX]
-
-
-def rank_profitable(traders: list[dict], price_sol: float | None, limit: int = 10,
-                    require_verified: bool = False) -> list[dict]:
-    """Total profit = realized + value of still-held (bought) tokens at today's price minus their cost.
-    Keep only real winners: profit >= max(0.1 SOL, 10% of SOL put in). Never returns losers."""
-    out = []
-    for x in traders:
-        unreal = unrealized(x, price_sol, require_verified)
-        x["unrealized_sol"] = round(unreal, 4)
-        x["profit_sol"] = round(x["realized_sol"] + unreal, 4)
-        x["profit_pct"] = round(100 * x["profit_sol"] / x["sol_in"]) if x["sol_in"] else 0
-        if x["profit_sol"] >= max(MIN_PROFIT_SOL, MIN_PROFIT_PCT * x["sol_in"]):
-            out.append(x)
-    out.sort(key=lambda x: -x["profit_sol"])
-    return out[:limit]
-
-
-def pick_sigs(sigs_newest_first: list[dict], cap: int) -> tuple[list[dict], bool]:
-    """Returns sigs OLDEST first (launch matters most). All if small; else earliest 60% + newest 40%."""
-    if len(sigs_newest_first) <= cap:
-        return list(reversed(sigs_newest_first)), False
-    early = sigs_newest_first[-int(cap * 0.6):]
-    late = sigs_newest_first[:cap - len(early)]
-    return list(reversed(early)) + list(reversed(late)), True
-
-
+# ------------------------------------------------------------------ the scan
 async def coin_scan(svc: Services, mint: str, progress=None) -> dict:
     t0 = time.monotonic()
     if mint in STABLES or mint == WSOL:
         raise ValueError("That's SOL or a stablecoin — paste a memecoin's mint instead.")
+    rpc, market = svc.rpc, svc.market
     if progress:
-        await progress("📜 Finding trades for this coin…")
-    cap = config.COIN_MAX_SIGS
-    all_sigs = await svc.rpc.signatures(mint, 0, cap)
-    sigs = [s for s in all_sigs if not s.get("err")]
-    if not sigs:
-        raise ValueError("No trades found for this coin.")
-    full_history = len(all_sigs) < cap
-    chosen, sampled = pick_sigs(sigs, config.COIN_MAX_TXS)
-    dex = (await svc.market.dex_info([mint])).get(mint)
-    # the earliest+newest sample can miss whales: add recent big trades (>$1k) from GeckoTerminal (1 call)
-    big_added = 0
-    if sampled and dex and dex.get("pair"):
-        have = {x["signature"] for x in chosen}
-        extra = [x for x in await svc.market.large_trades(dex["pair"], LARGE_TRADE_USD) if x["signature"] not in have]
-        extra = extra[:LARGE_TRADE_MAX]
-        n_early = int(config.COIN_MAX_TXS * 0.6)
-        chosen = chosen[:n_early] + extra + chosen[n_early:]     # before the newest part, in case time runs out
-        big_added = len(extra)
+        await progress("🔎 Finding top holders and big traders…")
+    pairs = await market.pairs(mint)
+    if not pairs:
+        raise ValueError("No trading pair found for this coin on DexScreener.")
+    sol_usd = SolPrice(await market.sol_usd_series()).at(time.time())
+    best = pairs[0]
+    price_usd = float(best.get("priceUsd") or 0)
+    price_sol = price_usd / sol_usd if price_usd else None
+    launch_ms = min((p.get("pairCreatedAt") or 0) for p in pairs if p.get("pairCreatedAt")) if any(
+        p.get("pairCreatedAt") for p in pairs) else None
+    launch_ts = launch_ms / 1000 if launch_ms else None
+    values = quote_values(pairs, sol_usd)
+    pool_addrs = {p.get("pairAddress") for p in pairs}
+
+    token_program = ((await rpc.account_info(mint)) or {}).get("owner") or TOKEN_PROGRAM
+
+    # candidates: holders (real wallets only) + traders, fetched at the same time
+    async def get_holders():
+        accs = await rpc.largest_holders(mint)
+        parsed = await rpc.accounts(accs)
+        owners = [((((a or {}).get("data") or {}).get("parsed") or {}).get("info") or {}).get("owner") for a in parsed]
+        pairs_owned = [(o, acc) for o, acc in zip(owners, accs) if o]
+        owner_info = await rpc.accounts([o for o, _ in pairs_owned], parsed=False)
+        return [(o, acc) for (o, acc), info in zip(pairs_owned, owner_info)
+                if info and info.get("owner") == SYSTEM_PROGRAM and o not in pool_addrs]
+
+    async def get_trades():
+        out: list[dict] = []
+        for p in pairs[:2]:
+            if p.get("pairAddress"):
+                out += await market.pool_trades(p["pairAddress"], 1000)
+                out += await market.pool_trades(p["pairAddress"], 0)
+        return out
+    h_res, trades = await asyncio.gather(get_holders(), get_trades(), return_exceptions=True)
+    holder_err = isinstance(h_res, BaseException)
+    if holder_err and not isinstance(h_res, DataBusy):
+        log.warning("holders lookup failed: %r", h_res)
+    holders = [] if holder_err else h_res
+    if isinstance(trades, BaseException):
+        log.warning("pool trades failed: %r", trades)
+        trades = []
+    cands = merge_candidates(holders, trades, exclude=pool_addrs)
+    if not cands:
+        if holder_err:
+            raise DataBusy("no candidates: holders call failed and no recent trades")
+        raise ValueError("No recent traders or holders found for this coin.")
+
+    # each candidate's own token-account history
+    if progress:
+        await progress(f"📜 Reading {len(cands)} wallets' history on this coin…")
+    sem = asyncio.Semaphore(8 if config.CUSTOM_RPC else 3)
+    sig_lists: dict[str, list[dict] | None] = {}
+    accts: dict[str, str] = {}
+
+    async def sigs_for(w, acc):
+        account = acc or ata_address(w, mint, token_program)
+        accts[w] = account
+        async with sem:
+            try:
+                res = await rpc.call("getSignaturesForAddress", [account, {"limit": PER_WALLET_MAX_TX + 1}])
+            except DataBusy:
+                sig_lists[w] = None
+                return
+        sig_lists[w] = [{"signature": s["signature"], "slot": s.get("slot"), "blockTime": s.get("blockTime")}
+                        for s in res or [] if not s.get("err")]
+    await asyncio.gather(*(sigs_for(w, acc) for w, acc, _ in cands))
+    failed_sig = [w for w, _, _ in cands if sig_lists.get(w) is None]
+    if len(failed_sig) > len(cands) / 2:
+        raise DataBusy(f"history lookups failed for {len(failed_sig)} of {len(cands)} wallets")
+    very_active = [w for w, _, _ in cands if sig_lists.get(w) and len(sig_lists[w]) > PER_WALLET_MAX_TX]
+    todo = [(w, src) for w, _, src in cands if sig_lists.get(w) is not None and w not in very_active]
+    # fewest transactions first: a wallet only counts once ALL its txs are read, so this checks the most wallets
+    todo.sort(key=lambda x: len(sig_lists[x[0]]))
+    seen_sig: set[str] = set()
+    all_sigs = []
+    for w, _ in todo:
+        for s in sig_lists[w]:
+            if s["signature"] not in seen_sig:
+                seen_sig.add(s["signature"])
+                all_sigs.append(s)
 
     async def txprog(done, total):
         if progress:
             await progress(f"📜 Reading trades… {done}/{total}")
-    got = await svc.rpc.many_tx(chosen, config.TX_BUDGET_S, progress=txprog)
-    swaps, transfers = extract_events(got, mint)
-    dev, launch_slots = None, set()
-    if full_history:
-        oldest = sigs[-1]
-        creation = next((red for s, red in got if s["signature"] == oldest["signature"]), None)
-        dev = creation.get("payer") if creation else None
-        if oldest.get("slot"):
-            launch_slots.add(oldest["slot"])
-    buy_slots = [e["slot"] for e in swaps if e["side"] == "BUY" and e["slot"]]
-    if buy_slots and (full_history or not sampled):
-        launch_slots.add(min(buy_slots))
-    ranked, flagged, small = aggregate_traders(swaps, transfers, dev=dev, launch_slots=launch_slots)
-    price_sol = None
-    if dex and dex.get("price"):
-        price_sol = dex["price"] / SolPrice(await svc.market.sol_usd_series()).at(time.time())
-    # verify on-chain holdings for the likely top wallets under every preset, so re-filtering later
-    # needs no API calls (unverified holdings count sells only)
-    for x in pick_for_verification(ranked, price_sol):
-        apply_balance(x, await svc.rpc.token_balance(x["wallet"], mint))
+    got = await rpc.many_tx(all_sigs, max(10.0, BUDGET_S - (time.monotonic() - t0)),
+                            concurrency=16 if config.CUSTOM_RPC else 6, progress=txprog)
+    if all_sigs:
+        rpc.check_batch(min_attempts=min(10, len(all_sigs)))
+    reds = {s["signature"]: red for s, red in got}
+
+    # current balances of each wallet's token account (one call per 100)
+    accounts = [accts[w] for w, _ in todo]
+    bal_raw = await rpc.accounts(accounts) if accounts else []
+    rows, unchecked = [], 0
+    for (w, src), acc_info in zip(todo, bal_raw):
+        sl = sig_lists[w]
+        if any(s["signature"] not in reds for s in sl):
+            unchecked += 1                       # ran out of time / failed: don't guess
+            continue
+        info = ((((acc_info or {}).get("data") or {}).get("parsed") or {}).get("info") or {})
+        balance = float((info.get("tokenAmount") or {}).get("uiAmount") or 0)
+        events = []
+        for s in sl:
+            c = classify(reds[s["signature"]], w, mint, values)
+            if c:
+                events.append((reds[s["signature"]].get("t") or s.get("blockTime") or 0, s.get("slot") or 0, c))
+        r = wallet_pnl(w, events, balance)
+        r["source"] = src
+        rows.append(r)
+    flag_wallets(rows, launch_ts)
+    order = sorted((r for r in rows if r["first_t"]), key=lambda r: r["first_t"])
+    for i, r in enumerate(order, 1):
+        r["entry_rank"] = i
+    flagged = [r for r in rows if r["flags"]]
+    real = [r for r in rows if not r["flags"] and not r["unknown"] and r["sol_in"] >= MIN_REAL_SOL]
     keep = ("wallet", "buys", "sells", "sol_in", "sol_out", "realized_sol", "held_tokens", "held_cost_sol",
-            "holding_pct", "entry_rank", "balance_ok", "tok_in")
-    candidates = [{k: x.get(k) for k in keep} for x in ranked]
-    return {"mint": mint, "sym": (dex or {}).get("sym") or "?", "sigs": len(sigs), "txs": len(got),
-            "sampled": sampled or not full_history, "sig_cap": cap, "swaps": len(swaps), "candidates": candidates,
-            "price_sol": price_sol, "big_trades_added": big_added,
-            "real_traders": len(ranked), "priced": price_sol is not None, "flagged": flagged[:25], "flagged_count": len(flagged), "small": small,
-            "dev": dev, "launch_checked": bool(launch_slots), "seconds": round(time.monotonic() - t0, 1),
-            "first_seen": min((s.get("blockTime") or 0) for s in sigs)}
+            "holding_pct", "entry_rank", "balance_ok", "tok_in", "first_t", "source")
+    flagged.sort(key=lambda x: -(x["sol_out"] + x["sol_in"]))
+    return {"mint": mint, "sym": (best.get("baseToken") or {}).get("symbol") or "?", "version": 2,
+            "candidates": [{k: r.get(k) for k in keep} for r in real], "price_sol": price_sol,
+            "priced": price_sol is not None, "launch_ts": launch_ts,
+            "checked": len(rows), "wanted": len(cands), "very_active": len(very_active), "unchecked": unchecked,
+            "history_failed": len(failed_sig), "holders_found": len(holders), "holders_failed": holder_err,
+            "unvalued": sum(1 for r in rows if r["unknown"]), "small": sum(1 for r in rows if not r["flags"]
+                                                                          and r["sol_in"] < MIN_REAL_SOL),
+            "flagged": [{k: r.get(k) for k in ("wallet", "sol_in", "sol_out", "reasons")} for r in flagged[:25]],
+            "flagged_count": len(flagged), "seconds": round(time.monotonic() - t0, 1)}

@@ -16,7 +16,7 @@ from .market import Market
 from .net import Net
 from .scan import Services, wallet_scan
 from .sim import SimParams, build_trades, simulate
-from .solana import Rpc, is_address, short
+from .solana import DataBusy, Rpc, is_address, short
 
 log = logging.getLogger("mimic.bot")
 
@@ -111,6 +111,12 @@ class MimicBot:
         t0 = time.monotonic()
         try:
             text, kb = await self.queue.run(lambda: work(progress), on_position=on_pos)
+        except DataBusy as e:
+            log.warning("check %s: data source busy (%s)", cid, e)
+            self.db.finish_check(cid, False, "busy: " + str(e))
+            await self._edit(msg, f"⚠️ The free data sources are busy right now, so I couldn't get complete data.\n"
+                                  f"Please try again in a few minutes. <i>Check #{cid} didn't count.</i>", KB([home_row()]))
+            return
         except UserError as e:
             self.db.finish_check(cid, False, str(e))
             await self._edit(msg, f"⚠️ {e}\n<i>Check #{cid} didn't count.</i>", KB([home_row()]))
@@ -170,7 +176,7 @@ class MimicBot:
 
     def _coin_work(self, mint: str, user_id: int, ctx):
         async def work(progress):
-            key = "coin4:" + mint
+            key = "coin5:" + mint
             res = self.db.cache_get(key)
             if res is None:
                 try:
@@ -193,10 +199,10 @@ class MimicBot:
                 [B(f"Min put in: {f.min_in:g} SOL", callback_data="fs:min_in"), B(f"Max put in: {mx}", callback_data="fs:max_in")],
                 [B(f"Min profit: {f.min_profit:g} SOL", callback_data="fs:min_profit"),
                  B(f"Min profit: {f.min_pct:g}%", callback_data="fs:min_pct")],
-                [B(f"Buyers: {'all' if not f.max_rank else f'first {f.max_rank}'}", callback_data="fs:max_rank")],
+                [B(f"Buyers: {'all' if not f.max_rank else f'first {f.max_rank} (of checked)'}", callback_data="fs:max_rank")],
                 [B(f"Holding: {HOLDING_NAMES[f.holding]} 🔄", callback_data="fc:holding"),
                  B(f"Sort: {SORT_NAMES[f.sort]} 🔄", callback_data="fc:sort")]]
-        if ud.get("filter_mint") and self.db.cache_get("coin4:" + ud["filter_mint"]) is not None:
+        if ud.get("filter_mint") and self.db.cache_get("coin5:" + ud["filter_mint"]) is not None:
             rows.append([B(f"✅ Show {ud.get('filter_sym', 'coin')} with this filter", callback_data="fa")])
         rows.append(home_row())
         text = (f"⚙️ <b>Coin Scan filters</b>\n{describe(f)}\n\nPick a preset, or tap a value to change it.\n"
@@ -307,7 +313,7 @@ class MimicBot:
             await self._edit(q.message, t, kb)
         elif data == "fa":
             mint = ud.get("filter_mint")
-            res = self.db.cache_get("coin4:" + mint) if mint else None
+            res = self.db.cache_get("coin5:" + mint) if mint else None
             if res is None:
                 await q.message.reply_text("That scan expired — run the Coin Scan again.", reply_markup=KB([home_row()]))
                 return
@@ -317,7 +323,7 @@ class MimicBot:
                 await q.message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
                                            reply_markup=kb if i == len(parts) else None)
         elif data.startswith("cf:"):
-            res = self.db.cache_get("coin4:" + data[3:])
+            res = self.db.cache_get("coin5:" + data[3:])
             if res is None:
                 await q.message.reply_text("That scan expired — run the Coin Scan again.", reply_markup=KB([home_row()]))
             else:

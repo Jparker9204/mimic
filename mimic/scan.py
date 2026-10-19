@@ -139,6 +139,6 @@ async def wallet_scan(svc: Services, wallet: str, progress=None, days: int | Non
             if progress and i % 5 == 4:
                 await progress(f"💹 Checking prices… {i + 1}/{min(len(newest), config.MAX_TOKENS)}")
     stats = summarize(newest)
-    return {"wallet": wallet, "days": days, "scanned_at": now, "covered_from": covered_from,
+    return {"wallet": wallet, "days": days, "scanned_at": now, "covered_from": covered_from, "sol_usd": sol.at(now),
             "sigs": len(sigs), "txs": len(got), "capped": capped, "stats": stats,
             "positions": newest, "seconds": round(time.monotonic() - t_start, 1)}

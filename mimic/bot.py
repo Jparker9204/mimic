@@ -1,6 +1,7 @@
 """Telegram UI (buttons first). Long polling, so no open ports and no web server needed."""
 from __future__ import annotations
-import asyncio, logging, time
+import asyncio
+import secrets, logging, time
 from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as KB, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
@@ -138,7 +139,8 @@ class MimicBot:
         async def work(progress):
             res = await self._get_scan(wallet, progress)
             ctx.user_data["last_wallet"] = wallet
-            kb = KB([[B("🧪 Copytrade Sim", callback_data="sim:new")],
+            kb = KB([[B("🏆 Best & worst trades", callback_data="wb:" + wallet)],
+                     [B("🧪 Copytrade Sim", callback_data="sim:new")],
                      [B("🔁 Rescan", callback_data="ws:" + wallet)] + home_row()])
             return texts.wallet_scan_text(res), kb
         return work
@@ -216,7 +218,11 @@ class MimicBot:
             if not trades:
                 raise UserError("No coins with price data to simulate for this wallet.")
             res = simulate(trades, p, sol.at, now=scan["scanned_at"])
-            kb = KB([[B("🧪 New sim", callback_data="sim:new"), B("🔍 Wallet", callback_data="ws:" + wallet)], home_row()])
+            sim_id = secrets.token_hex(6)
+            self.db.cache_set("simres:" + sim_id, {"wallet": wallet, "label": p.label(), "rows": [
+                {k: r[k] for k in ("mint", "sym", "pnl_sol", "sol_in", "exit")} for r in res.rows]}, config.CACHE_TTL_S)
+            kb = KB([[B("📊 Sim trades", callback_data="st:" + sim_id)],
+                     [B("🧪 New sim", callback_data="sim:new"), B("🔍 Wallet", callback_data="ws:" + wallet)], home_row()])
             return texts.sim_text(wallet, p.label(), res.summary, p.delay_s), kb
         return work
 
@@ -328,6 +334,23 @@ class MimicBot:
                 await q.message.reply_text("That scan expired — run the Coin Scan again.", reply_markup=KB([home_row()]))
             else:
                 parts = texts.split_message(texts.flagged_text(res))
+                for i, part in enumerate(parts, 1):
+                    await q.message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                                               reply_markup=KB([home_row()]) if i == len(parts) else None)
+        elif data.startswith("wb:") or data.startswith("st:"):
+            # free views of cached results: no check, no API calls
+            if data.startswith("wb:"):
+                res = self.db.cache_get("scan:" + data[3:])
+                t = texts.best_worst_text(res) if res else None
+                gone = "That scan expired — run the Wallet Scan again."
+            else:
+                res = self.db.cache_get("simres:" + data[3:])
+                t = texts.sim_trades_text(res) if res else None
+                gone = "That sim expired — run it again."
+            if t is None:
+                await q.message.reply_text(gone, reply_markup=KB([home_row()]))
+            else:
+                parts = texts.split_message(t)
                 for i, part in enumerate(parts, 1):
                     await q.message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
                                                reply_markup=KB([home_row()]) if i == len(parts) else None)

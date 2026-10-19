@@ -23,6 +23,8 @@ A Telegram bot that tells you whether a Solana wallet is worth copy-trading. Eve
   - **no real buy:** spent under 0.01 SOL in total.
   
   Only wallets that put in at least 0.05 SOL are ranked.
+- **🏆 Best & worst trades** (Wallet Scan button, free, from the cached scan, no check): the wallet's 5 best and 5 worst coins by profit in SOL (sells plus coins still held at today's price), with put in, held time, still-holding %, and a tap-to-copy mint. A luck check shows how much of the total comes from the best coin and the total without it.
+- **📊 Sim trades** (Copytrade Sim button, free): the sim's 5 best and 5 worst copied trades with result and exit reason, plus the total without the best trade.
 - **⚙️ Filters** (Coin Scan; saved per user, all buttons). Open them from the main menu or from a Coin Scan result.
   - **Presets:** 🐟 Small (put in 0.05–1 SOL, profit ≥0.1), 🐬 Mid (put in 1–10, profit ≥1), 🐳 Whale (put in ≥10, profit ≥5), and Any (the default).
   - **Custom (tap, then type a number):** min/max SOL put in, min profit SOL, min profit % (default 10), first N buyers.

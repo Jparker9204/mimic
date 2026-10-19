@@ -160,3 +160,79 @@ def limits_text(usage: dict, user_id: int, now: float | None = None) -> str:
     w, c, s = usage["wallet"], usage["coin"], usage["sim"]
     return (f"📊 <b>Today</b>\n🔍 Wallet scans {w[0]}/{w[1]}\n🪙 Coin scans {c[0]}/{c[1]}\n🧪 Sims {s[0]}/{s[1]}\n"
             f"Resets in {left // 3600}h {left % 3600 // 60}m (00:00 UTC)\nYour ID: <code>{user_id}</code>")
+
+
+# ---------------------------------------------------------------- best & worst trades
+def _luck_lines(lk: dict, what: str) -> list[str]:
+    if lk["n"] == 0:
+        return []
+    if lk["share"] is None:
+        out = [f"🎲 Luck check: no overall profit ({lk['total']:+.2f} SOL)."]
+    elif lk["share"] > 100:
+        out = [f"🎲 Luck check: best {what} made {lk['best']:+.2f} SOL, more than the whole total "
+               f"({lk['total']:+.2f} SOL). The rest lost."]
+    else:
+        out = [f"🎲 Luck check: best {what} = {lk['share']}% of total profit"]
+    if lk["n"] >= 2:
+        out.append(f"Without its best trade: <b>{lk['without_best']:+.2f} SOL</b>")
+        if lk["total"] > 0 and lk["without_best"] <= 0:
+            out.append(f"⚠️ The profit comes from one {what}. Could be luck.")
+        elif lk["share"] is not None and lk["share"] <= 50 and lk["without_best"] > 0:
+            out.append(f"✅ Profit is spread over several {what}s.")
+    return out
+
+
+def best_worst_text(scan: dict) -> str:
+    from .trades import best_worst, coin_profits, luck
+    rows, unpriced = coin_profits(scan)
+    best, worst = best_worst(rows, "profit_sol")
+    lines = ["🏆 <b>Best &amp; worst trades</b>", addr(scan["wallet"]),
+             f"<i>Last {scan.get('days', 14)} days · profit = sells + coins still held at today's price</i>", ""]
+
+    def block(title, items):
+        lines.append(f"<b>{title}</b>")
+        if not items:
+            lines.append("None")
+        for i, r in enumerate(items, 1):
+            held = ago(r["held_s"]) + (" so far" if r["still_in"] else "") if r["held_s"] is not None else "?"
+            dead = " · 💀 dead" if r["dead"] else ""
+            lines.extend([f"{i}. <b>{html.escape(r['sym'])}</b> · <b>{r['profit_sol']:+.2f} SOL ({r['profit_pct']:+d}%)</b>",
+                          f"   Put in: {r['sol_in']:.2f} SOL · Held: {held} · Still holding: {r['holding_pct']}%{dead}",
+                          f"   {addr(r['mint'])}"])
+        lines.append("")
+    if not rows:
+        lines.append("No coins with a price to rank in this scan.")
+    else:
+        block("🟢 Best 5", best)
+        block("🔴 Worst 5", worst)
+        lines.extend(_luck_lines(luck(rows, "profit_sol"), "coin"))
+        lines.append(f"<i>{len(rows)} coins counted.</i>")
+    if unpriced:
+        lines.append(f"<i>{unpriced} coin{'s' if unpriced != 1 else ''} still held with no current price left out.</i>")
+    return "\n".join(lines)
+
+
+def sim_trades_text(sim: dict) -> str:
+    from .trades import best_worst, luck
+    rows = sim.get("rows") or []
+    best, worst = best_worst(rows, "pnl_sol")
+    lines = ["📊 <b>Sim trades</b>", addr(sim["wallet"]), html.escape(sim.get("label", "")), ""]
+
+    def block(title, items):
+        lines.append(f"<b>{title}</b>")
+        if not items:
+            lines.append("None")
+        for i, r in enumerate(items, 1):
+            pct = round(100 * r["pnl_sol"] / r["sol_in"]) if r.get("sol_in") else 0
+            lines.append(f"{i}. <b>{html.escape(r.get('sym') or '?')}</b> · <b>{r['pnl_sol']:+.3f} SOL ({pct:+d}%)</b> · "
+                         f"Exit: {html.escape(r.get('exit') or '?')}")
+        lines.append("")
+    if not rows:
+        lines.append("No copied trades in this sim.")
+    else:
+        block("🟢 Best 5", best)
+        block("🔴 Worst 5", worst)
+        lk = luck(rows, "pnl_sol")
+        lines.extend(_luck_lines(lk, "trade"))
+        lines.append(f"<i>{len(rows)} copied trades · total {lk['total']:+.3f} SOL</i>")
+    return "\n".join(lines)

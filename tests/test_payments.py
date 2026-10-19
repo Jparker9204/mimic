@@ -302,6 +302,7 @@ async def test_watcher_rechecks_unreadable_tx_and_late_window(watcher, monkeypat
     pay.expire(now=T0 + 2000)
     rpc.sigs[o2.reference] = [{"signature": "S2", "err": None}]
     rpc.txs["S2"] = mktx(reference=o2.reference, delta=20_000_000)
+    rpc.txs["S2"]["blockTime"] = T0 + 5 * 3600 - 60       # sent hours after the request expired
     evs = await watcher.poll_once(now=T0 + 5 * 3600)
     assert any(e.kind == "paid" and e.late for e in evs)
     # after the late window nothing is checked
@@ -323,9 +324,9 @@ async def test_watcher_failed_signature_skipped(watcher, monkeypatch):
 
 async def test_address_scan_matches_exact_amount_without_reference(watcher):
     pay, rpc = watcher.pay, watcher.rpc
-    rpc.sigs[ADDR] = [{"signature": "OLD", "err": None}]
+    rpc.sigs[ADDR] = [{"signature": "OLD", "err": None, "blockTime": T0 - 1000}]
     pay.create(1, 1, 50_000_000, now=T0)
-    await watcher.scan_address(ADDR, now=T0)             # first run: cursor = newest, history ignored
+    await watcher.scan_address(ADDR, now=T0)             # first run: txs before the order are stepped over
     assert pay.state_get("cursor:" + ADDR) == "OLD"
     rpc.sigs[ADDR] = [{"signature": "MAN", "err": None}, {"signature": "OLD", "err": None}]
     rpc.txs["MAN"] = mktx(reference=None, delta=50_000_000)
@@ -551,3 +552,147 @@ async def test_address_scan_records_extra_payment_for_paid_order(watcher):
     u = pay.unmatched()
     assert [x["signature"] for x in u] == ["AGAIN"] and f"order #{o.id}" in u[0]["note"]
     assert bal(pay).bought == 50
+
+
+# ---------------------------------------------------------------- regression: real test payment (fake keys)
+# Same shape as the real 0.001 SOL test payment that wasn't credited: a legacy tx, copied address +
+# amount in Phantom (NO reference), the FIRST transfer to a brand-new receiving wallet (its pre balance
+# is 0, so the transfer creates the account), compute-budget instructions, destination at index 1.
+REAL_BT = 1_792_448_994
+FAKE_SIG = "4Wqq" + "Fake" * 20
+
+
+def creation_transfer(dest=ADDR, lamports=1_000_000):
+    payer_pre = 5_020_330
+    return {"blockTime": REAL_BT, "slot": 458_999_217, "version": "legacy",
+            "meta": {"err": None, "fee": 80_330, "preBalances": [payer_pre, 0, 1, 1],
+                     "postBalances": [payer_pre - lamports - 80_330, lamports, 1, 1],
+                     "loadedAddresses": {"readonly": [], "writable": []}},
+            "transaction": {"signatures": [FAKE_SIG], "message": {
+                "header": {"numRequiredSignatures": 1, "numReadonlySignedAccounts": 0, "numReadonlyUnsignedAccounts": 2},
+                "accountKeys": [PAYER, dest, SYS, "ComputeBudget111111111111111111111111111111"],
+                "instructions": [{"programIdIndex": 3, "accounts": [], "data": "3Tvo4Px3GM2X"},
+                                 {"programIdIndex": 3, "accounts": [], "data": "FNCiLf"},
+                                 {"programIdIndex": 2, "accounts": [0, 1], "data": "3Bxs4Bc3VYuGVB19"}]}}}
+
+
+@pytest.fixture
+def small(monkeypatch):
+    monkeypatch.setattr(config, "MIN_PURCHASE_LAMPORTS", 1_000_000)
+
+
+def two_orders(pay):
+    """Order #1 at 5:22 PM, superseded by order #2 at 5:28 PM (same user, same 0.001 SOL); pay at 5:29:54."""
+    o1 = pay.create(42, 42, 1_000_000, now=REAL_BT - 474)
+    o2 = pay.create(42, 42, 1_000_000, now=REAL_BT - 114)
+    return o1, o2
+
+
+def test_real_shape_account_creation_transfer_verifies():
+    assert verify_tx(creation_transfer(), ADDR, None) == TxCheck(True, 1_000_000)
+    assert verify_tx(creation_transfer(), ADDR, new_reference()).reason == "no_reference"
+
+
+async def test_real_case_superseded_order_is_not_a_candidate(watcher, small):
+    pay, rpc = watcher.pay, watcher.rpc
+    await watcher.scan_address(ADDR, now=REAL_BT - 470)  # first scan: empty brand-new wallet
+    o1, o2 = two_orders(pay)
+    assert pay.get(o1.id).status == "replaced"
+    rpc.sigs[ADDR] = [{"signature": FAKE_SIG, "err": None, "blockTime": REAL_BT}]
+    rpc.txs[FAKE_SIG] = creation_transfer()
+    evs = await watcher.scan_address(ADDR, now=REAL_BT + 30)
+    assert [(e.kind, e.order.id, e.credits, e.late) for e in evs] == [("paid", o2.id, 1, False)]
+    assert pay.credits.balance(42, now=REAL_BT + 60).bought == 1
+    assert pay.get(o1.id).status == "replaced" and pay.unmatched() == []
+
+
+async def test_real_case_recorded_as_unmatched_by_old_code_is_credited_after_update(watcher, small):
+    """The production DB already holds the payment as 'unmatched' and the cursor is past it."""
+    pay, rpc = watcher.pay, watcher.rpc
+    o1, o2 = two_orders(pay)
+    pay.record_unmatched(FAKE_SIG, 1_000_000, REAL_BT, "no reference, no unique exact-amount order", now=REAL_BT + 20)
+    pay.state_set("cursor:" + ADDR, FAKE_SIG)
+    rpc.sigs[ADDR] = [{"signature": FAKE_SIG, "err": None, "blockTime": REAL_BT}]
+    pay.expire(now=REAL_BT + 3600)                       # the update happens after #2 expired
+    evs = await watcher.poll_once(now=REAL_BT + 3600)
+    paid = [e for e in evs if e.kind == "paid"]
+    assert [(e.order.id, e.credits, e.late) for e in paid] == [(o2.id, 1, False)]
+    assert watcher.got and watcher.got[-1].order.id == o2.id      # the user is told
+    assert pay.unmatched() == [] and pay.credits.balance(42, now=REAL_BT + 3700).bought == 1
+    # running again changes nothing
+    await watcher.scan_address(ADDR, now=REAL_BT + 3700)
+    assert pay.credits.balance(42, now=REAL_BT + 3700).bought == 1
+    assert pay.db.conn.execute("SELECT COUNT(*) FROM pay_credits").fetchone()[0] == 1
+
+
+async def test_payment_before_first_scan_is_not_skipped(watcher, small):
+    pay, rpc = watcher.pay, watcher.rpc
+    _, o2 = two_orders(pay)
+    rpc.sigs[ADDR] = [{"signature": FAKE_SIG, "err": None, "blockTime": REAL_BT}]
+    rpc.txs[FAKE_SIG] = creation_transfer()
+    evs = await watcher.scan_address(ADDR, now=REAL_BT + 30)   # no cursor yet
+    assert [e.order.id for e in evs] == [o2.id]
+
+
+async def test_second_copy_payment_never_matches_superseded_order(watcher, small):
+    pay, rpc = watcher.pay, watcher.rpc
+    o1, o2 = two_orders(pay)
+    pay.apply_tx(o2.id, "FIRST", TxCheck(True, 1_000_000), REAL_BT, now=REAL_BT)
+    assert pay.match_manual(1_000_000, REAL_BT + 60, ADDR, now=REAL_BT + 60) is None
+
+
+def test_cancelled_order_counts_only_without_a_newer_order(pay, small):
+    o = pay.create(7, 7, 1_000_000, now=T0)
+    pay.cancel(o.id, 7)
+    assert pay.match_manual(1_000_000, T0 + 30, ADDR, now=T0 + 30).id == o.id
+    newer = pay.create(7, 7, 2_000_000, now=T0 + 10)
+    assert pay.match_manual(1_000_000, T0 + 30, ADDR, now=T0 + 30) is None
+    assert pay.match_manual(2_000_000, T0 + 30, ADDR, now=T0 + 30).id == newer.id
+
+
+def test_two_users_same_amount_is_ambiguous(pay, small):
+    pay.create(1, 1, 1_000_000, now=T0)
+    pay.create(2, 2, 1_000_000, now=T0)
+    assert pay.match_manual(1_000_000, T0 + 30, ADDR, now=T0 + 30) is None
+
+
+async def test_ive_paid_runs_address_fallback_and_credits_admin(mbot, small):
+    log, tg = [], FakeTgBot()
+    ctx = _Obj(bot=tg, user_data={})
+    mbot.limits.admins = {42}
+    rpc = FakeRpc()
+    mbot.watcher.rpc = rpc
+    mbot.pay.state_set("cursor:" + ADDR, "")
+    o1, o2 = two_orders(mbot.pay)
+    rpc.sigs[ADDR] = [{"signature": FAKE_SIG, "err": None, "blockTime": REAL_BT}]
+    rpc.txs[FAKE_SIG] = creation_transfer()
+    await mbot.on_button(_update(f"pay:chk:{o2.id}", log, uid=42), ctx)
+    assert mbot.pay.get(o2.id).status == "paid"
+    assert mbot.limits.credits.balance(42).bought == 1           # admins get the purchased credits too
+    assert not any("Not on the blockchain" in x[1] for x in log)
+
+
+async def test_ive_paid_says_unmatched_payment_seen(mbot, small):
+    log = []
+    ctx = _Obj(bot=FakeTgBot(), user_data={})
+    rpc = FakeRpc()
+    mbot.watcher.rpc = rpc
+    mbot.pay.state_set("cursor:" + ADDR, "")
+    o = mbot.pay.create(1, 1, 1_000_000, now=REAL_BT - 100)
+    mbot.pay.create(2, 2, 1_000_000, now=REAL_BT - 100)          # another user, same amount
+    rpc.sigs[ADDR] = [{"signature": FAKE_SIG, "err": None, "blockTime": REAL_BT}]
+    rpc.txs[FAKE_SIG] = creation_transfer()
+    await mbot.on_button(_update(f"pay:chk:{o.id}", log, uid=1), ctx)
+    assert "We see a payment of 0.001 SOL but couldn't match it" in log[-1][1]
+    assert "admin will sort it out" in log[-1][1]
+
+
+async def test_rpc_null_result_tries_next_endpoint():
+    net = FakeNet([{"result": None}, {"result": None}, {"result": {"ok": 1}}])
+    rpc = PayRpc(net)
+    rpc.endpoints = [("a", "u1"), ("b", "u2"), ("c", "u3")]
+    assert await rpc.transaction("S") == {"ok": 1}
+    net2 = FakeNet([None, None])                               # rate limited everywhere
+    rpc2 = PayRpc(net2)
+    rpc2.endpoints = [("a", "u1"), ("b", "u2")]
+    assert await rpc2.transaction("S") is None

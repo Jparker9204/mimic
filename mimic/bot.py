@@ -460,11 +460,18 @@ class MimicBot:
             if time.monotonic() - last < 5:
                 return
             ud["pay_chk"] = time.monotonic()
-            events = await self.watcher.check_order(o)
-            if not events:
+            events = await self.watcher.check_now(o)
+            if events:
+                return                    # on_pay_event already told the user
+            seen = self.pay.unmatched_since(o.created_at - 120)
+            if seen:
                 await q.message.reply_text(
-                    "🔎 Not on the blockchain yet. A payment shows up about 30–60 seconds after you send it "
-                    "(Solana has to finalize it). I keep checking and will message you, no need to tap again.")
+                    f"👀 We see a payment of {fmt_sol(seen[0]['lamports'])} SOL but couldn't match it to "
+                    f"order #{o.id}. An admin will sort it out (no need to pay again).", reply_markup=KB([home_row()]))
+                return
+            await q.message.reply_text(
+                "🔎 Not on the blockchain yet. A payment shows up about 30–60 seconds after you send it "
+                "(Solana has to finalize it). I keep checking and will message you, no need to tap again.")
 
     async def on_pay_event(self, ev) -> None:
         if self.app is None:

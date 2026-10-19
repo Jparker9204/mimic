@@ -273,7 +273,7 @@ class Payments:
                                                        time.time() if now is None else now, note[:200]))
 
     def apply_tx(self, order_id: int, signature: str, check: TxCheck, block_time: float | None = None,
-                 now: float | None = None, note: str = "") -> PayEvent | None:
+                 now: float | None = None, note: str = "", claim_unmatched: bool = False) -> PayEvent | None:
         """Record one transaction for an order and credit the order when it's fully paid.
 
         One DB transaction: the tx row (signature is the primary key, so a signature is processed once),
@@ -283,6 +283,8 @@ class Payments:
         c = self.db.conn
         c.execute("BEGIN IMMEDIATE")
         try:
+            if claim_unmatched:      # an unmatched row for this signature is being assigned to an order now
+                c.execute("DELETE FROM pay_txs WHERE signature=? AND order_id IS NULL", (signature,))
             if c.execute("SELECT 1 FROM pay_txs WHERE signature=?", (signature,)).fetchone():
                 c.execute("ROLLBACK")
                 return None
@@ -307,7 +309,7 @@ class Payments:
                 return PayEvent("short", o, signature, total, missing=o.lamports - total)
             # paid: credit on what actually arrived (overpayment counts), never less than quoted
             n = max(o.credits, credits_for(total, o.price_lamports))
-            late = o.status != "open"
+            late = (block_time > o.expires_at) if block_time else o.status != "open"
             cur = c.execute("UPDATE pay_orders SET status='paid', paid_at=?, received_lamports=?, credited=?, signature=? "
                             "WHERE id=? AND status!='paid'", (now, total, n, signature, order_id))
             if cur.rowcount != 1:
@@ -327,12 +329,51 @@ class Payments:
                      now: float | None = None) -> Order | None:
         """A transfer without a reference (address + amount copied by hand): the single unpaid recent
         order for this recipient with exactly this amount, or exactly its missing rest (± tolerance),
-        created before the tx. Zero or several candidates -> None (recorded as unmatched)."""
+        created before the tx.
+
+        Per user only ONE order can be the candidate: an order replaced by a newer one never counts
+        (nor a cancelled one once the user has a newer order); the newest open/expired order wins.
+        Several users -> None (recorded as unmatched for an admin). Payments that carry a reference
+        are matched by that reference instead, whatever the order's status."""
         bt = block_time or (time.time() if now is None else now)
         cands = [o for o in self.unpaid_recent(now) if o.recipient == recipient and o.created_at <= bt + 120
                  and (abs(o.lamports - lamports) <= self.tol
                       or (o.received_lamports and abs(o.lamports - o.received_lamports - lamports) <= self.tol))]
-        return cands[0] if len(cands) == 1 else None
+        newest = {r[0]: r[1] for r in self.db.conn.execute("SELECT user_id, MAX(created_at) FROM pay_orders GROUP BY user_id")}
+        # a replaced order (or a cancelled one with a newer order) is never an amount-match candidate
+        cands = [o for o in cands if o.status in ("open", "expired")
+                 or (o.status == "cancelled" and o.created_at >= newest.get(o.user_id, 0))]
+        best: dict[int, Order] = {}
+        for o in cands:
+            cur = best.get(o.user_id)
+            key = (o.status in ("open", "expired"), o.created_at, o.id)
+            if cur is None or key > (cur.status in ("open", "expired"), cur.created_at, cur.id):
+                best[o.user_id] = o
+        return next(iter(best.values())) if len(best) == 1 else None
+
+    def retry_unmatched(self, recipient: str, now: float | None = None) -> list[PayEvent]:
+        """Re-try matching recorded unmatched reference-less payments (last LATE_PAYMENT_S), e.g. after
+        an order was created or the matching rules improved. Each one is credited at most once."""
+        now = time.time() if now is None else now
+        rows = self.db.conn.execute(
+            "SELECT signature, lamports, block_time FROM pay_txs WHERE order_id IS NULL AND lamports>0 "
+            "AND note LIKE 'no reference%' AND COALESCE(block_time, seen_at)>=?",
+            (now - config.LATE_PAYMENT_S,)).fetchall()
+        events = []
+        for sig, lam, bt in rows:
+            o = self.match_manual(int(lam), bt, recipient, now)
+            if o is not None:
+                ev = self.apply_tx(o.id, sig, TxCheck(True, int(lam)), bt, now, note="matched by amount (retry)",
+                                   claim_unmatched=True)
+                if ev:
+                    events.append(ev)
+        return events
+
+    def unmatched_since(self, since: float) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT signature, lamports, block_time, note FROM pay_txs WHERE order_id IS NULL AND lamports>0 "
+            "AND COALESCE(block_time, seen_at)>=? ORDER BY seen_at DESC LIMIT 3", (since,)).fetchall()
+        return [dict(zip(("signature", "lamports", "block_time", "note"), r)) for r in rows]
 
     def state_get(self, k: str) -> str | None:
         r = self.db.conn.execute("SELECT v FROM pay_state WHERE k=?", (k,)).fetchone()
@@ -366,18 +407,27 @@ class PayRpc:
         self.endpoints = ([("custom", config.CUSTOM_RPC)] if config.CUSTOM_RPC else []) + [
             ("publicnode", config.PUBLICNODE_RPC), ("mainnet", config.MAINNET_RPC)]
 
-    async def _call(self, method: str, params: list):
-        """(ok, result). Tries each endpoint; a JSON-RPC error body is returned to the caller."""
+    async def _call(self, method: str, params: list, null_next: bool = False):
+        """(ok, result). Tries each endpoint; a JSON-RPC error body is returned to the caller.
+        null_next: a null result (node hasn't got the tx) tries the next endpoint too."""
         last_err = None
+        got_null = False
         for bucket, url in self.endpoints:
             j = await self.net.request(bucket, "POST", url, retries=3,
                                        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
             if isinstance(j, dict) and "result" in j:
+                if j["result"] is None and null_next:
+                    got_null = True
+                    continue
                 return True, j["result"]
             if isinstance(j, dict) and "error" in j:
                 last_err = j["error"]
                 if VERSION_RE.search(str((last_err or {}).get("message", ""))):
                     return False, last_err
+        if got_null:
+            return True, None
+        if last_err is None:
+            log.warning("%s failed on every RPC endpoint (rate limited or down)", method)
         return False, last_err
 
     async def signatures(self, address: str, limit: int = 25, until: str | None = None,
@@ -395,7 +445,8 @@ class PayRpc:
         the version it names (and remember it)."""
         for _ in range(2):
             ok, res = await self._call("getTransaction", [sig, {"encoding": "json", "commitment": "finalized",
-                                                                "maxSupportedTransactionVersion": self.max_version}])
+                                                                "maxSupportedTransactionVersion": self.max_version}],
+                                       null_next=True)
             if ok:
                 return res
             m = VERSION_RE.search(str((res or {}).get("message", ""))) if isinstance(res, dict) else None
@@ -415,6 +466,7 @@ class PaymentWatcher:
         self._locks: dict[int, asyncio.Lock] = {}
         self._addr_next = 0.0
         self.scan_addr = True     # also match reference-less exact-amount transfers to the receiving address
+        self._scan_lock = asyncio.Lock()
 
     async def run_forever(self) -> None:
         while True:
@@ -472,22 +524,44 @@ class PaymentWatcher:
                     break
         return events
 
+    async def check_now(self, o: Order, now: float | None = None) -> list[PayEvent]:
+        """'I've paid': the order's reference AND the receiving address (copied address + amount)."""
+        events = await self.check_order(o, now=now)
+        if not any(e.kind == "paid" for e in events) and self.scan_addr and o.recipient:
+            events += await self.scan_address(o.recipient, now=now)
+        return events
+
     async def scan_address(self, address: str, now: float | None = None) -> list[PayEvent]:
+        async with self._scan_lock:
+            events = await self._scan_address(address, now)
+            for ev in self.pay.retry_unmatched(address, now):
+                events.append(ev)
+                await self._notify(ev)
+            return events
+
+    async def _scan_address(self, address: str, now: float | None = None) -> list[PayEvent]:
         """New finalized txs of the receiving address that carry no order reference: exact-amount
         transfers (address + amount copied by hand) are matched to a single unpaid order."""
         key = "cursor:" + address
         cursor = self.pay.state_get(key)
-        if cursor is None:                             # first run: start from now, ignore history
-            page = await self.rpc.signatures(address, limit=1)
-            if page is not None:
-                self.pay.state_set(key, page[0]["signature"] if page else "")
-            return []
+        # No cursor yet (first run): read the newest page instead of trusting "now" as the start, so a
+        # payment that landed before the first scan isn't skipped. Txs older than the oldest unpaid
+        # order can't be a payment for it and are only stepped over.
+        unpaid = self.pay.unpaid_recent(now)
+        floor = min((o.created_at for o in unpaid), default=now or time.time()) - 120
         sigs = await self.rpc.signatures(address, limit=100, until=cursor or None)
+        if sigs is None:
+            return []
         if not sigs:
+            if cursor is None:
+                self.pay.state_set(key, "")
             return []
         events = []
         for s in reversed(sigs):                       # oldest first; stop at the first unreadable tx
             sig = s["signature"]
+            if s.get("blockTime") is not None and s["blockTime"] < floor:
+                self.pay.state_set(key, sig)
+                continue
             if s.get("err") is None and not self.pay.seen(sig):
                 tx = await self.rpc.transaction(sig)
                 if tx is None:

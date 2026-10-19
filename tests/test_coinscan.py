@@ -74,9 +74,8 @@ def test_extract_events_payer_swap_and_transfer():
 
 
 def res_for(ranked, flagged, small, price=None):
-    from mimic.coinscan import rank_profitable
-    return {"mint": M, "sym": "WEFT", "sigs": 10, "txs": 10, "sampled": False,
-            "traders": rank_profitable(ranked, price), "flagged": flagged, "flagged_count": len(flagged),
+    return {"mint": M, "sym": "WEFT", "sigs": 10, "txs": 10, "sampled": False, "price_sol": price,
+            "candidates": ranked, "flagged": flagged, "flagged_count": len(flagged),
             "small": small, "launch_checked": True, "priced": price is not None}
 
 

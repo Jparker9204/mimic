@@ -9,6 +9,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from . import config, texts
 from .coinscan import coin_scan
 from .db import DB
+from .filters import CYCLE, HOLDING_NAMES, PRESET_NAMES, PRESETS, SORT_NAMES, Filter, apply_filter
 from .jobqueue import JobQueue
 from .limits import KIND_NAMES, Limits
 from .market import Market
@@ -26,7 +27,17 @@ class UserError(Exception):
 
 def menu_kb() -> KB:
     return KB([[B("🔍 Wallet Scan", callback_data="m:wallet"), B("🪙 Coin Scan", callback_data="m:coin")],
-               [B("📊 My Limits", callback_data="m:limits"), B("💳 Credits", callback_data="m:credits")]])
+               [B("⚙️ Filters", callback_data="m:filters"), B("📊 My Limits", callback_data="m:limits")],
+               [B("💳 Credits", callback_data="m:credits")]])
+
+
+FILTER_PROMPTS = {
+    "min_in": "✏️ Type the minimum SOL put in (e.g. 2)",
+    "max_in": "✏️ Type the maximum SOL put in (0 = no max)",
+    "min_profit": "✏️ Type the minimum profit in SOL (e.g. 1)",
+    "min_pct": "✏️ Type the minimum profit in % (e.g. 50)",
+    "max_rank": "✏️ Only the first N buyers: type N (e.g. 50, 0 = all)",
+}
 
 
 def home_row() -> list:
@@ -136,9 +147,30 @@ class MimicBot:
             self.db.cache_set(key, res, config.CACHE_TTL_S)
         return res
 
-    def _coin_work(self, mint: str):
+    def get_filter(self, user_id: int) -> Filter:
+        return Filter.from_dict(self.db.get_setting(user_id, "coin_filter"))
+
+    def coin_view(self, res: dict, flt: Filter) -> tuple[str, KB]:
+        """Render a cached coin scan with a filter. Pure: no API calls, no check used."""
+        shown, _ = apply_filter(res.get("candidates") or [], flt, res.get("price_sol"))
+        rows, row = [], []
+        for i, t in enumerate(shown, 1):
+            row.append(B(f"🔍 {i}. {short(t['wallet'])}", callback_data="ws:" + t["wallet"]))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        extra = [B("⚙️ Filters", callback_data="cflt:" + res["mint"])]
+        if res.get("flagged_count"):
+            extra.append(B("🚩 Show flagged", callback_data="cf:" + res["mint"]))
+        rows.append(extra)
+        rows.append(home_row())
+        return texts.coin_scan_text(res, flt), KB(rows)
+
+    def _coin_work(self, mint: str, user_id: int, ctx):
         async def work(progress):
-            key = "coin3:" + mint
+            key = "coin4:" + mint
             res = self.db.cache_get(key)
             if res is None:
                 try:
@@ -146,19 +178,30 @@ class MimicBot:
                 except ValueError as e:
                     raise UserError(str(e)) from e
                 self.db.cache_set(key, res, config.CACHE_TTL_S)
-            rows, row = [], []
-            for i, t in enumerate(res["traders"], 1):
-                row.append(B(f"🔍 {i}. {short(t['wallet'])}", callback_data="ws:" + t["wallet"]))
-                if len(row) == 2:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
-            if res.get("flagged_count"):
-                rows.append([B("🚩 Show flagged", callback_data="cf:" + mint)])
-            rows.append(home_row())
-            return texts.coin_scan_text(res), KB(rows)
+            ctx.user_data["filter_mint"], ctx.user_data["filter_sym"] = mint, res.get("sym", "?")
+            return self.coin_view(res, self.get_filter(user_id))
         return work
+
+    def filters_screen(self, user_id: int, ud: dict) -> tuple[str, KB]:
+        f = self.get_filter(user_id)
+        from .filters import describe
+
+        def pb(key):
+            return B(("✅ " if f.preset == key else "") + PRESET_NAMES[key], callback_data="fp:" + key)
+        mx = "no max" if f.max_in is None else f"{f.max_in:g} SOL"
+        rows = [[pb("small"), pb("mid"), pb("whale"), pb("any")],
+                [B(f"Min put in: {f.min_in:g} SOL", callback_data="fs:min_in"), B(f"Max put in: {mx}", callback_data="fs:max_in")],
+                [B(f"Min profit: {f.min_profit:g} SOL", callback_data="fs:min_profit"),
+                 B(f"Min profit: {f.min_pct:g}%", callback_data="fs:min_pct")],
+                [B(f"Buyers: {'all' if not f.max_rank else f'first {f.max_rank}'}", callback_data="fs:max_rank")],
+                [B(f"Holding: {HOLDING_NAMES[f.holding]} 🔄", callback_data="fc:holding"),
+                 B(f"Sort: {SORT_NAMES[f.sort]} 🔄", callback_data="fc:sort")]]
+        if ud.get("filter_mint") and self.db.cache_get("coin4:" + ud["filter_mint"]) is not None:
+            rows.append([B(f"✅ Show {ud.get('filter_sym', 'coin')} with this filter", callback_data="fa")])
+        rows.append(home_row())
+        text = (f"⚙️ <b>Coin Scan filters</b>\n{describe(f)}\n\nPick a preset, or tap a value to change it.\n"
+                "<i>Saved for your next scans. Changing filters never uses a check.</i>")
+        return text, KB(rows)
 
     def _sim_work(self, wallet: str, p: SimParams):
         async def work(progress):
@@ -176,7 +219,7 @@ class MimicBot:
         if kind == "wallet":
             work = self._wallet_work(target, ctx)
         elif kind == "coin":
-            work = self._coin_work(target)
+            work = self._coin_work(target, uid, ctx)
         else:
             p = SimParams(**ctx.user_data.get("sim_params", {}))
             work = self._sim_work(target, p)
@@ -240,8 +283,41 @@ class MimicBot:
                 await self.start_kind(update, ctx, "wallet" if data == "as:w" else "coin", addr)
         elif data.startswith("ws:"):
             await self.start_kind(update, ctx, "wallet", data[3:])
+        elif data == "m:filters" or data.startswith("cflt:"):
+            if data.startswith("cflt:"):
+                ud["filter_mint"] = data[5:]
+            t, kb = self.filters_screen(update.effective_user.id, ud)
+            await q.message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+        elif data[:3] in ("fp:", "fc:", "fs:"):
+            uid = update.effective_user.id
+            f = self.get_filter(uid)
+            k, v = data.split(":", 1)
+            if k == "fs":
+                if v in FILTER_PROMPTS:
+                    ud["await"] = "flt:" + v
+                    await q.message.reply_text(FILTER_PROMPTS[v])
+                return
+            if k == "fp" and v in PRESETS:
+                f = PRESETS[v]
+            elif k == "fc" and v in CYCLE:
+                opts = CYCLE[v]
+                f = f.set(v, opts[(opts.index(getattr(f, v)) + 1) % len(opts)])
+            self.db.set_setting(uid, "coin_filter", f.to_dict())
+            t, kb = self.filters_screen(uid, ud)
+            await self._edit(q.message, t, kb)
+        elif data == "fa":
+            mint = ud.get("filter_mint")
+            res = self.db.cache_get("coin4:" + mint) if mint else None
+            if res is None:
+                await q.message.reply_text("That scan expired — run the Coin Scan again.", reply_markup=KB([home_row()]))
+                return
+            t, kb = self.coin_view(res, self.get_filter(update.effective_user.id))
+            parts = texts.split_message(t)
+            for i, part in enumerate(parts, 1):
+                await q.message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                                           reply_markup=kb if i == len(parts) else None)
         elif data.startswith("cf:"):
-            res = self.db.cache_get("coin3:" + data[3:])
+            res = self.db.cache_get("coin4:" + data[3:])
             if res is None:
                 await q.message.reply_text("That scan expired — run the Coin Scan again.", reply_markup=KB([home_row()]))
             else:
@@ -293,6 +369,21 @@ class MimicBot:
         ud = ctx.user_data
         txt = (update.effective_message.text or "").strip()
         mode = ud.get("await")
+        if mode and mode.startswith("flt:"):
+            key = mode[4:]
+            try:
+                val = float(txt.replace(",", ".").rstrip("%").replace("SOL", "").strip())
+                if val < 0 or val > 1e7:
+                    raise ValueError
+            except ValueError:
+                await update.effective_message.reply_text("Please type a number (e.g. 5).")
+                return
+            uid = update.effective_user.id
+            self.db.set_setting(uid, "coin_filter", self.get_filter(uid).set(key, val).to_dict())
+            ud.pop("await", None)
+            t, kb = self.filters_screen(uid, ud)
+            await update.effective_message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
         if mode in ("custom_size", "custom_sl"):
             try:
                 val = float(txt.replace(",", ".").rstrip("%").lstrip("-"))

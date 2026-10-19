@@ -15,6 +15,12 @@ CREATE TABLE IF NOT EXISTS checks (
   note TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_checks_user ON checks(user_id, created_at);
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER NOT NULL,
+  k TEXT NOT NULL,
+  v TEXT NOT NULL,
+  PRIMARY KEY (user_id, k)
+);
 CREATE TABLE IF NOT EXISTS cache (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL,
@@ -62,6 +68,14 @@ class DB:
     def fail_stale_running(self) -> None:
         """On startup, anything still 'running' died with the old process: mark failed (doesn't count)."""
         self.conn.execute("UPDATE checks SET status='failed', note='interrupted' WHERE status='running'")
+
+    # ---- per-user settings ------------------------------------------------
+    def get_setting(self, user_id: int, k: str) -> Any | None:
+        r = self.conn.execute("SELECT v FROM user_settings WHERE user_id=? AND k=?", (user_id, k)).fetchone()
+        return json.loads(r[0]) if r else None
+
+    def set_setting(self, user_id: int, k: str, v: Any) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO user_settings(user_id,k,v) VALUES(?,?,?)", (user_id, k, json.dumps(v)))
 
     # ---- cache ------------------------------------------------------------
     def cache_get(self, k: str) -> Any | None:

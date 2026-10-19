@@ -90,6 +90,24 @@ class Market:
         """1-minute candles covering ~16 hours after t0 (one call). Past data, so cache long."""
         return await self.candles(pool, mint, 1, int(t0) + 59000, 7 * 86400)
 
+    async def large_trades(self, pool: str, min_usd: float = 1000.0) -> list[dict]:
+        """Recent (~last 300) trades above min_usd on a pool: [{signature, slot, blockTime}]. 1 call."""
+        j = await self.net.request("gecko", "GET", f"{GT}/pools/{pool}/trades?trade_volume_in_usd_greater_than={min_usd:g}")
+        out = []
+        try:
+            for d in j["data"]:
+                a = d["attributes"]
+                ts = a.get("block_timestamp") or ""
+                try:
+                    import datetime as _dt
+                    bt = _dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc).timestamp()
+                except ValueError:
+                    bt = None
+                out.append({"signature": a["tx_hash"], "slot": a.get("block_number"), "blockTime": bt, "err": None})
+        except (TypeError, KeyError):
+            return []
+        return out
+
     async def sol_usd_series(self) -> list[list[float]]:
         hit = self.db.cache_get("solusd")
         if hit is not None:

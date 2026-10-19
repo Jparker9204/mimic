@@ -20,6 +20,10 @@ from .solana import STABLES, WSOL, parse_swap
 MIN_REAL_SOL = 0.05     # rank only traders who put in at least this much
 MIN_PROFIT_SOL = 0.1    # "real profit" = at least this much SOL...
 MIN_PROFIT_PCT = 0.10   # ...and at least 10% of what they put in
+LARGE_TRADE_USD = 1000.0
+LARGE_TRADE_MAX = 120
+VERIFY_PER_PRESET = 15
+VERIFY_MAX = 40
 NO_BUY_SOL = 0.01       # below this, the wallet basically didn't buy
 CLUSTER_MIN = 3         # wallets in one block with similar size
 CLUSTER_SPREAD = 1.10   # max/min SOL ratio inside a cluster
@@ -166,6 +170,25 @@ def estimate_profit(x: dict, price_sol: float | None) -> float:
     return x["realized_sol"] + unrealized(x, price_sol)
 
 
+def pick_for_verification(ranked: list[dict], price_sol: float | None) -> list[dict]:
+    """Union of the likely top wallets (by estimated profit) inside each preset's size range."""
+    if not price_sol:
+        return []
+    from .filters import PRESETS
+    holders = sorted((x for x in ranked if x.get("held_tokens", 0) > 0), key=lambda x: -estimate_profit(x, price_sol))
+    picked: dict[str, dict] = {}
+    for f in PRESETS.values():
+        n = 0
+        for x in holders:
+            if x["sol_in"] < f.min_in or (f.max_in is not None and x["sol_in"] > f.max_in):
+                continue
+            picked.setdefault(x["wallet"], x)
+            n += 1
+            if n >= VERIFY_PER_PRESET:
+                break
+    return list(picked.values())[:VERIFY_MAX]
+
+
 def rank_profitable(traders: list[dict], price_sol: float | None, limit: int = 10,
                     require_verified: bool = False) -> list[dict]:
     """Total profit = realized + value of still-held (bought) tokens at today's price minus their cost.
@@ -204,6 +227,16 @@ async def coin_scan(svc: Services, mint: str, progress=None) -> dict:
         raise ValueError("No trades found for this coin.")
     full_history = len(all_sigs) < cap
     chosen, sampled = pick_sigs(sigs, config.COIN_MAX_TXS)
+    dex = (await svc.market.dex_info([mint])).get(mint)
+    # the earliest+newest sample can miss whales: add recent big trades (>$1k) from GeckoTerminal (1 call)
+    big_added = 0
+    if sampled and dex and dex.get("pair"):
+        have = {x["signature"] for x in chosen}
+        extra = [x for x in await svc.market.large_trades(dex["pair"], LARGE_TRADE_USD) if x["signature"] not in have]
+        extra = extra[:LARGE_TRADE_MAX]
+        n_early = int(config.COIN_MAX_TXS * 0.6)
+        chosen = chosen[:n_early] + extra + chosen[n_early:]     # before the newest part, in case time runs out
+        big_added = len(extra)
 
     async def txprog(done, total):
         if progress:
@@ -221,17 +254,19 @@ async def coin_scan(svc: Services, mint: str, progress=None) -> dict:
     if buy_slots and (full_history or not sampled):
         launch_slots.add(min(buy_slots))
     ranked, flagged, small = aggregate_traders(swaps, transfers, dev=dev, launch_slots=launch_slots)
-    dex = (await svc.market.dex_info([mint])).get(mint)
     price_sol = None
     if dex and dex.get("price"):
         price_sol = dex["price"] / SolPrice(await svc.market.sol_usd_series()).at(time.time())
-    # verify current holdings of the likely winners on-chain (sampled history can miss their later sells)
-    cands = sorted((x for x in ranked if x.get("held_tokens", 0) > 0), key=lambda x: -estimate_profit(x, price_sol))
-    for x in cands[:15] if price_sol else []:
+    # verify on-chain holdings for the likely top wallets under every preset, so re-filtering later
+    # needs no API calls (unverified holdings count sells only)
+    for x in pick_for_verification(ranked, price_sol):
         apply_balance(x, await svc.rpc.token_balance(x["wallet"], mint))
-    winners = rank_profitable(ranked, price_sol, require_verified=True)
+    keep = ("wallet", "buys", "sells", "sol_in", "sol_out", "realized_sol", "held_tokens", "held_cost_sol",
+            "holding_pct", "entry_rank", "balance_ok", "tok_in")
+    candidates = [{k: x.get(k) for k in keep} for x in ranked]
     return {"mint": mint, "sym": (dex or {}).get("sym") or "?", "sigs": len(sigs), "txs": len(got),
-            "sampled": sampled or not full_history, "sig_cap": cap, "swaps": len(swaps), "traders": winners,
+            "sampled": sampled or not full_history, "sig_cap": cap, "swaps": len(swaps), "candidates": candidates,
+            "price_sol": price_sol, "big_trades_added": big_added,
             "real_traders": len(ranked), "priced": price_sol is not None, "flagged": flagged[:25], "flagged_count": len(flagged), "small": small,
             "dev": dev, "launch_checked": bool(launch_slots), "seconds": round(time.monotonic() - t0, 1),
             "first_seen": min((s.get("blockTime") or 0) for s in sigs)}

@@ -23,6 +23,11 @@ A Telegram bot that tells you whether a Solana wallet is worth copy-trading. Eve
   - **no real buy:** spent under 0.01 SOL in total.
   
   Only wallets that put in at least 0.05 SOL are ranked.
+- **⚙️ Filters** (Coin Scan; saved per user, all buttons). Open them from the main menu or from a Coin Scan result.
+  - **Presets:** 🐟 Small (put in 0.05–1 SOL, profit ≥0.1), 🐬 Mid (put in 1–10, profit ≥1), 🐳 Whale (put in ≥10, profit ≥5), and Any (the default).
+  - **Custom (tap, then type a number):** min/max SOL put in, min profit SOL, min profit % (default 10), first N buyers.
+  - **Toggles:** still holding (any / still holding / fully sold), sort by (profit SOL / profit % / earliest buyer).
+  - Applying a filter to a cached scan uses no check and makes no API calls.
 - **Limits** (per Telegram user, per UTC day): 5 wallet scans, 3 coin scans, 2 sims.
   - 25s cooldown between checks, with a live countdown.
   - At most 2 heavy jobs run at once; others are told "you're #N in line".

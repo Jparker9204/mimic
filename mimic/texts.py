@@ -79,31 +79,43 @@ def sim_text(wallet: str, label: str, summ: dict, delay_s: int = 15) -> str:
     return "\n".join(lines)
 
 
-def coin_scan_text(res: dict) -> str:
-    head = f"🪙 <b>Coin Scan · {html.escape(res['sym'])}</b>\n{addr(res['mint'])}\n<b>Top traders by profit</b>"
+def coin_scan_text(res: dict, flt=None) -> str:
+    from .filters import Filter, apply_filter, describe
+    flt = flt or Filter()
+    rows_data, total = apply_filter(res.get("candidates") or [], flt, res.get("price_sol"))
+    head = (f"🪙 <b>Coin Scan · {html.escape(res['sym'])}</b>\n{addr(res['mint'])}\n"
+            f"<i>{html.escape(describe(flt))}</i>\n<b>Top traders</b>")
+    rank_note = "" if res.get("launch_checked", True) else " in our sample"
     rows = []
-    for i, t in enumerate(res["traders"], 1):
-        pct = f" ({t['profit_pct']:+d}%)" if t.get("sol_in") else ""
-        rows += [f"{i}. Profit: <b>{t['profit_sol']:+.2f} SOL{pct}</b>",
+    for i, t in enumerate(rows_data, 1):
+        rows += [f"{i}. Profit: <b>{t['profit_sol']:+.2f} SOL ({t['profit_pct']:+d}%)</b>",
                  f"   Put in: {t['sol_in']:.2f} SOL · Still holding: {t['holding_pct']}%",
-                 f"   Bought: #{ordinal(t['entry_rank'])} buyer",
+                 f"   Bought: #{ordinal(t['entry_rank'])} buyer{rank_note}",
                  f"   {addr(t['wallet'])}", ""]
-    n = len(res["traders"])
-    if n == 0:
-        rows = ["No wallet made real profit on this coin (at least 0.1 SOL and 10%).", ""]
-    elif n < 10:
-        rows.append(f"Only {n} wallet{'s' if n != 1 else ''} made real profit on this coin.")
+    default = flt.preset == "any"
+    if total == 0:
+        rows = ["No wallet made real profit on this coin (at least 0.1 SOL and 10%)." if default
+                else "No wallets match this filter. Try ⚙️ Filters.", ""]
+    elif total < 10:
+        rows.append(f"Only {total} wallet{'s' if total != 1 else ''} "
+                    + ("made real profit on this coin." if default else ("match" if total != 1 else "matches")
+                       + " this filter."))
+    elif total > 10:
+        rows.append(f"Showing top 10 of {total} matching wallets.")
     extra = []
     if res.get("flagged_count"):
         extra.append(f"🚩 Hid {res['flagged_count']} bundle/transfer wallet{'s' if res['flagged_count'] != 1 else ''}")
-    if res.get("small"):
+    if res.get("small") and default:
         extra.append(f"🤏 Skipped {res['small']} tiny buyers (under 0.05 SOL)")
     if not res.get("priced", True):
         extra.append("<i>No current price, so profit counts sells only.</i>")
     if not res.get("launch_checked", True):
-        extra.append("<i>Too many trades to see the launch, so the launch-block check was skipped.</i>")
+        extra.append("<i>Too many trades to see the launch, so buyer numbers count from the oldest trade we could read "
+                     "and the launch-block check was skipped.</i>")
+    big = f" + {res['big_trades_added']} recent big trades" if res.get("big_trades_added") else ""
     note = (f"<i>Based on {res['txs']} of {res['sigs']}{'+' if res['sigs'] >= res.get('sig_cap', 5000) else ''} trades "
-            f"(earliest + newest), so it's approximate.</i>" if res["sampled"] else f"<i>Based on all {res['txs']} trades.</i>")
+            f"(earliest + newest{big}), so it's approximate and can miss some whales.</i>"
+            if res["sampled"] else f"<i>Based on all {res['txs']} trades.</i>")
     return "\n".join([head, ""] + rows + extra + [note])
 
 

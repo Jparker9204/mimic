@@ -239,4 +239,4 @@ def test_bot_busy_source():
     from mimic import bot
     src = inspect.getsource(bot.MimicBot.run_check)
     assert "except DataBusy" in src and "didn't count" in src
-    assert src.index("except DataBusy") < src.index("except Exception")
+    assert src.index("except DataBusy") < src.rindex("except Exception")

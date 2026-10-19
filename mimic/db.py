@@ -1,4 +1,4 @@
-"""SQLite storage: check log (used for limits) and a TTL key/value cache."""
+"""SQLite storage: check log, credit balances + ledger, per-user settings and a TTL key/value cache."""
 from __future__ import annotations
 import json, os, sqlite3, time
 from typing import Any
@@ -21,6 +21,28 @@ CREATE TABLE IF NOT EXISTS user_settings (
   v TEXT NOT NULL,
   PRIMARY KEY (user_id, k)
 );
+CREATE TABLE IF NOT EXISTS credits (
+  user_id INTEGER PRIMARY KEY,
+  free INTEGER NOT NULL,          -- free credits (refilled lazily, capped)
+  bought INTEGER NOT NULL DEFAULT 0,  -- purchased/granted credits (no cap, never expire)
+  last_refill REAL NOT NULL,      -- start of the current refill period
+  created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS credit_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  ts REAL NOT NULL,
+  kind TEXT NOT NULL,             -- signup | migrate | refill | spend | refund | grant
+  delta_free INTEGER NOT NULL,
+  delta_bought INTEGER NOT NULL,
+  free_after INTEGER NOT NULL,
+  bought_after INTEGER NOT NULL,
+  check_id INTEGER,
+  actor INTEGER,                  -- admin user id for grants
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_ledger_user ON credit_ledger(user_id, ts);
+CREATE INDEX IF NOT EXISTS ix_ledger_check ON credit_ledger(check_id);
 CREATE TABLE IF NOT EXISTS cache (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL,
@@ -65,9 +87,17 @@ class DB:
         r = self.conn.execute("SELECT COUNT(*) FROM checks WHERE user_id=? AND status='running'", (user_id,)).fetchone()
         return int(r[0])
 
-    def fail_stale_running(self) -> None:
-        """On startup, anything still 'running' died with the old process: mark failed (doesn't count)."""
+    def fail_stale_running(self) -> list[int]:
+        """On startup, anything still 'running' died with the old process: mark failed (doesn't count).
+        Returns their ids so their credits can be refunded."""
+        ids = [int(r[0]) for r in self.conn.execute("SELECT id FROM checks WHERE status='running'")]
         self.conn.execute("UPDATE checks SET status='failed', note='interrupted' WHERE status='running'")
+        return ids
+
+    def has_history(self, user_id: int) -> bool:
+        """True if this user used the bot before credits existed (any check or saved setting)."""
+        return bool(self.conn.execute("SELECT 1 FROM checks WHERE user_id=? LIMIT 1", (user_id,)).fetchone()
+                    or self.conn.execute("SELECT 1 FROM user_settings WHERE user_id=? LIMIT 1", (user_id,)).fetchone())
 
     # ---- per-user settings ------------------------------------------------
     def get_setting(self, user_id: int, k: str) -> Any | None:

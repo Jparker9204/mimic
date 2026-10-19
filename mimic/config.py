@@ -28,12 +28,32 @@ RECENT_RPC_HISTORY_HOURS = _float("MIMIC_RECENT_RPC_HOURS", 30)
 
 ADMIN_IDS = {int(x) for x in (os.getenv("MIMIC_ADMIN_IDS") or "").replace(" ", "").split(",") if x.isdigit()}
 
-# Free tier limits (per Telegram user, per UTC day)
-FREE_LIMITS = {
-    "coin": _int("MIMIC_FREE_COIN", 3),
-    "wallet": _int("MIMIC_FREE_WALLET", 5),
-    "sim": _int("MIMIC_FREE_SIM", 2),
+# Credits (all optional env overrides; restart the service to apply)
+# Cost of each action in credits. Cached free extras (best/worst trades, sim trades) cost nothing.
+COSTS = {
+    "coin": max(0, _int("MIMIC_COST_COIN", 10)),
+    "wallet": max(0, _int("MIMIC_COST_WALLET", 3)),
+    "sim": max(0, _int("MIMIC_COST_SIM", 15)),
 }
+FREE_REFILL = max(0, _int("MIMIC_FREE_REFILL", 40))          # free credits added per interval (also the start balance)
+REFILL_HOURS = max(0.01, _float("MIMIC_REFILL_HOURS", 6))    # refill interval
+FREE_CAP = max(0, _int("MIMIC_FREE_CAP", 500))               # free credits never stack above this
+
+
+def _packs(raw: str) -> list[tuple[int, float]]:
+    """Parse "100:0.05,250:0.1" into [(100, 0.05), (250, 0.1)]. Display only: payments aren't live."""
+    out = []
+    for part in raw.replace(" ", "").split(","):
+        try:
+            c, p = part.split(":")
+            if int(c) > 0 and float(p) > 0:
+                out.append((int(c), float(p)))
+        except ValueError:
+            continue
+    return out
+
+
+PACKS = _packs(os.getenv("MIMIC_PACKS") or "") or [(100, 0.05), (250, 0.1)]
 COOLDOWN_S = _int("MIMIC_COOLDOWN_S", 25)
 MAX_HEAVY_JOBS = _int("MIMIC_MAX_JOBS", 2)
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import asyncio
 import secrets, logging, time
-from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as KB, Update
+from telegram import BotCommand, InlineKeyboardButton as B, InlineKeyboardMarkup as KB, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -12,7 +12,8 @@ from .coinscan import coin_scan
 from .db import DB
 from .filters import CYCLE, HOLDING_NAMES, PRESET_NAMES, PRESETS, SORT_NAMES, Filter, apply_filter
 from .jobqueue import JobQueue
-from .limits import KIND_NAMES, Limits
+from .credits import InsufficientCredits
+from .limits import Limits
 from .market import Market
 from .net import Net
 from .scan import Services, wallet_scan
@@ -23,13 +24,14 @@ log = logging.getLogger("mimic.bot")
 
 
 class UserError(Exception):
-    """A failure we can explain to the user (still doesn't count against limits)."""
+    """A failure we can explain to the user (its credits are refunded)."""
 
 
 def menu_kb() -> KB:
-    return KB([[B("🔍 Wallet Scan", callback_data="m:wallet"), B("🪙 Coin Scan", callback_data="m:coin")],
-               [B("⚙️ Filters", callback_data="m:filters"), B("📊 My Limits", callback_data="m:limits")],
-               [B("💳 Credits", callback_data="m:credits")]])
+    cl = texts.cost_label
+    return KB([[B(f"🔍 Wallet Scan · {cl('wallet')}", callback_data="m:wallet"),
+                B(f"🪙 Coin Scan · {cl('coin')}", callback_data="m:coin")],
+               [B("⚙️ Filters", callback_data="m:filters"), B("💳 Credits", callback_data="m:credits")]])
 
 
 FILTER_PROMPTS = {
@@ -48,11 +50,12 @@ def home_row() -> list:
 class MimicBot:
     def __init__(self, db: DB | None = None):
         self.db = db or DB(config.DB_PATH)
-        self.db.fail_stale_running()
+        self.limits = Limits(self.db)
+        for cid in self.db.fail_stale_running():
+            self.limits.refund(cid, note="interrupted by restart")
         self.db.prune()
         self.net = Net()
         self.svc = Services(Rpc(self.net, self.db), Market(self.net, self.db))
-        self.limits = Limits(self.db)
         self.queue = JobQueue(config.MAX_HEAVY_JOBS)
 
     # ---------------------------------------------------------------- helpers
@@ -69,6 +72,19 @@ class MimicBot:
         return await ctx.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb,
                                           disable_web_page_preview=True)
 
+    def balance_line(self, user_id: int) -> str:
+        admin = self.limits.is_admin(user_id)
+        b = None if admin else self.limits.credits.balance(user_id)
+        return texts.balance_line(b, self.limits.credits, admin=admin)
+
+    def menu_text(self, user_id: int, head: str = "Pick an option:") -> str:
+        return f"{head}\n{self.balance_line(user_id)}"
+
+    def credits_screen(self, user_id: int) -> str:
+        admin = self.limits.is_admin(user_id)
+        b = self.limits.credits.balance(user_id)
+        return texts.credits_text(b, self.limits.credits, user_id, admin=admin)
+
     async def _countdown(self, chat_id: int, ctx, wait_s: int, retry: tuple) -> None:
         ctx.user_data["retry"] = retry
         msg = await self._send(chat_id, ctx, f"⏳ Cooldown: please wait <b>{wait_s}s</b>")
@@ -84,7 +100,8 @@ class MimicBot:
         await self._edit(msg, "✅ Ready!", KB([[B("▶️ Run it now", callback_data="retry")], home_row()]))
 
     async def run_check(self, chat_id: int, user_id: int, ctx, kind: str, target: str, work) -> None:
-        """Limits → queue → work → log. `work(progress)` returns (text, keyboard)."""
+        """Credits/cooldown → charge → queue → work → log. `work(progress)` returns (text, keyboard).
+        Any failure refunds the credits it took."""
         v = self.limits.check(user_id, kind)
         if not v.ok:
             if v.reason == "cooldown":
@@ -92,13 +109,29 @@ class MimicBot:
             elif v.reason == "busy":
                 await self._send(chat_id, ctx, "⏳ You already have a check running. One at a time 🙂")
             else:
-                h, m = v.wait_s // 3600, v.wait_s % 3600 // 60
-                await self._send(chat_id, ctx,
-                                 f"🚫 Free limit reached: {v.used}/{v.limit} {KIND_NAMES[kind]} today.\n"
-                                 f"Resets in {h}h {m}m.", KB([[B("💳 Credits", callback_data="m:credits")], home_row()]))
+                await self._send(chat_id, ctx, texts.no_credits_text(kind, v.cost, v.balance, self.limits.credits,
+                                                                     v.enough_in),
+                                 KB([[B("💳 Credits", callback_data="m:credits")], home_row()]))
             return
         cid = self.db.start_check(user_id, kind, target)
-        msg = await self._send(chat_id, ctx, f"Check #{cid} ⏳ starting…")
+        try:
+            cost = self.limits.charge(user_id, kind, cid)
+        except InsufficientCredits:
+            self.db.finish_check(cid, False, "no credits")
+            await self._send(chat_id, ctx, "😅 Not enough credits for that.", KB([[B("💳 Credits", callback_data="m:credits")]]))
+            return
+
+        def refund(note: str) -> str:
+            n = self.limits.refund(cid, note=note)
+            return f"Check #{cid} didn't count" + (f": {texts.cr(n)} refunded." if n else ".")
+
+        paid = f" · {texts.cr(cost)}" if cost else ""
+        try:
+            msg = await self._send(chat_id, ctx, f"Check #{cid}{paid} ⏳ starting…")
+        except Exception:
+            self.db.finish_check(cid, False, "send failed")
+            refund("message failed")
+            raise
         last = [0.0]
 
         async def progress(text: str) -> None:
@@ -115,21 +148,27 @@ class MimicBot:
         except DataBusy as e:
             log.warning("check %s: data source busy (%s)", cid, e)
             self.db.finish_check(cid, False, "busy: " + str(e))
+            note = refund("data source busy")
             await self._edit(msg, f"⚠️ The free data sources are busy right now, so I couldn't get complete data.\n"
-                                  f"Please try again in a few minutes. <i>Check #{cid} didn't count.</i>", KB([home_row()]))
+                                  f"Please try again in a few minutes. <i>{note}</i>", KB([home_row()]))
             return
         except UserError as e:
             self.db.finish_check(cid, False, str(e))
-            await self._edit(msg, f"⚠️ {e}\n<i>Check #{cid} didn't count.</i>", KB([home_row()]))
+            note = refund("no result: " + str(e))
+            await self._edit(msg, f"⚠️ {e}\n<i>{note}</i>", KB([home_row()]))
             return
         except Exception as e:  # noqa: BLE001
             log.exception("check %s failed", cid)
             self.db.finish_check(cid, False, repr(e))
-            await self._edit(msg, f"⚠️ Check #{cid} failed (free data sources are busy). It didn't count — "
-                                  "try again in a minute.", KB([home_row()]))
+            note = refund("error")
+            await self._edit(msg, f"⚠️ Check #{cid} failed (free data sources are busy). <i>{note}</i>\n"
+                                  "Try again in a minute.", KB([home_row()]))
             return
         self.db.finish_check(cid, True)
-        parts = texts.split_message(f"{text}\n\nCheck #{cid} ✅ · {time.monotonic() - t0:.0f}s")
+        footer = f"Check #{cid} ✅ · {time.monotonic() - t0:.0f}s"
+        if cost:
+            footer += f" · −{texts.cr(cost)} · 💳 {self.limits.credits.balance(user_id).total} left"
+        parts = texts.split_message(f"{text}\n\n{footer}")
         await self._edit(msg, parts[0], kb if len(parts) == 1 else None)
         for i, part in enumerate(parts[1:], 2):
             await self._send(chat_id, ctx, part, kb if i == len(parts) else None)
@@ -140,8 +179,8 @@ class MimicBot:
             res = await self._get_scan(wallet, progress)
             ctx.user_data["last_wallet"] = wallet
             kb = KB([[B("🏆 Best & worst trades", callback_data="wb:" + wallet)],
-                     [B("🧪 Copytrade Sim", callback_data="sim:new")],
-                     [B("🔁 Rescan", callback_data="ws:" + wallet)] + home_row()])
+                     [B(f"🧪 Copytrade Sim · {texts.cost_label('sim')}", callback_data="sim:new")],
+                     [B(f"🔁 Rescan · {texts.cost_label('wallet')}", callback_data="ws:" + wallet)] + home_row()])
             return texts.wallet_scan_text(res), kb
         return work
 
@@ -174,7 +213,10 @@ class MimicBot:
             extra.append(B("🚩 Show flagged", callback_data="cf:" + res["mint"]))
         rows.append(extra)
         rows.append(home_row())
-        return texts.coin_scan_text(res, flt), KB(rows)
+        text = texts.coin_scan_text(res, flt)
+        if shown:
+            text += f"\n<i>Tap a wallet below to Wallet Scan it ({texts.cost_label('wallet')}).</i>"
+        return text, KB(rows)
 
     def _coin_work(self, mint: str, user_id: int, ctx):
         async def work(progress):
@@ -208,7 +250,7 @@ class MimicBot:
             rows.append([B(f"✅ Show {ud.get('filter_sym', 'coin')} with this filter", callback_data="fa")])
         rows.append(home_row())
         text = (f"⚙️ <b>Coin Scan filters</b>\n{describe(f)}\n\nPick a preset, or tap a value to change it.\n"
-                "<i>Saved for your next scans. Changing filters never uses a check.</i>")
+                "<i>Saved for your next scans. Changing filters is free (no credits).</i>")
         return text, KB(rows)
 
     def _sim_work(self, wallet: str, p: SimParams):
@@ -257,14 +299,62 @@ class MimicBot:
                         home_row()]))
         p = SimParams(**s)
         return (f"🧪 <b>Ready to run</b>\n{p.label()}\n<i>Assumes ~{p.delay_s}s copy delay.</i>",
-                KB([[B("▶️ Run sim", callback_data="sim:run")], [B("✏️ Change", callback_data="sim:new")], home_row()]))
+                KB([[B(f"▶️ Run sim · {texts.cost_label('sim')}", callback_data="sim:run")], [B("✏️ Change", callback_data="sim:new")], home_row()]))
 
     # ---------------------------------------------------------------- handlers
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data.pop("await", None)
         await update.effective_message.reply_text(
-            "👋 <b>Mimic</b> — check if a Solana wallet is worth copying.\nPick an option:",
+            self.menu_text(update.effective_user.id, "👋 <b>Mimic</b> — check if a Solana wallet is worth copying.\n"
+                                                     "Pick an option:"),
             parse_mode=ParseMode.HTML, reply_markup=menu_kb())
+
+    async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        ctx.user_data.pop("await", None)
+        await update.effective_message.reply_text(texts.help_text(), parse_mode=ParseMode.HTML, reply_markup=menu_kb())
+
+    async def cmd_credits(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(self.credits_screen(update.effective_user.id),
+                                                  parse_mode=ParseMode.HTML, reply_markup=KB([home_row()]))
+
+    async def cmd_grant(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin only: /grant <telegram_id> <amount> [note]. Adds (or removes, if negative) purchased credits."""
+        uid = update.effective_user.id
+        if not self.limits.is_admin(uid):
+            await update.effective_message.reply_text("This command is for admins only.")
+            return
+        args = ctx.args or []
+        try:
+            target, amount = int(args[0]), int(args[1])
+            if amount == 0:
+                raise ValueError
+        except (IndexError, ValueError):
+            await update.effective_message.reply_text(
+                "Usage: /grant <telegram_id> <amount> [note]\nAmount can be negative to take purchased credits back.")
+            return
+        note = " ".join(args[2:])[:200] or "admin grant"
+        try:
+            b = self.limits.credits.grant(target, amount, actor=uid, note=note)
+        except InsufficientCredits as e:
+            await update.effective_message.reply_text(f"Not done: {e}.")
+            return
+        log.info("admin %s granted %+d purchased credits to %s", uid, amount, target)
+        await update.effective_message.reply_text(
+            f"✅ {amount:+d} purchased credits for <code>{target}</code>.\n"
+            + texts.balance_line(b, self.limits.credits), parse_mode=ParseMode.HTML)
+
+    async def cmd_ledger(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin only: /ledger <telegram_id> shows the latest credit changes (for refund disputes)."""
+        if not self.limits.is_admin(update.effective_user.id):
+            await update.effective_message.reply_text("This command is for admins only.")
+            return
+        try:
+            target = int((ctx.args or [])[0])
+        except (IndexError, ValueError):
+            await update.effective_message.reply_text("Usage: /ledger <telegram_id>")
+            return
+        rows = self.limits.credits.ledger(target, 20)
+        await update.effective_message.reply_text(texts.ledger_text(target, rows), parse_mode=ParseMode.HTML)
 
     async def on_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -276,19 +366,19 @@ class MimicBot:
         ud = ctx.user_data
         if data == "m:home":
             ud.pop("await", None)
-            await q.message.reply_text("Pick an option:", reply_markup=menu_kb())
+            await q.message.reply_text(self.menu_text(update.effective_user.id), parse_mode=ParseMode.HTML,
+                                       reply_markup=menu_kb())
         elif data == "m:wallet":
             ud["await"] = "wallet"
-            await q.message.reply_text("🔍 Paste a Solana <b>wallet</b> address 👇", parse_mode=ParseMode.HTML)
+            await q.message.reply_text(f"🔍 Paste a Solana <b>wallet</b> address 👇\n<i>Costs {texts.cost_label('wallet')}"
+                                       f" · {self.balance_line(update.effective_user.id)}</i>", parse_mode=ParseMode.HTML)
         elif data == "m:coin":
             ud["await"] = "coin"
-            await q.message.reply_text("🪙 Paste a coin's <b>mint</b> address 👇", parse_mode=ParseMode.HTML)
-        elif data == "m:limits":
-            await q.message.reply_text(texts.limits_text(self.limits.usage(update.effective_user.id), update.effective_user.id),
+            await q.message.reply_text(f"🪙 Paste a coin's <b>mint</b> address 👇\n<i>Costs {texts.cost_label('coin')}"
+                                       f" · {self.balance_line(update.effective_user.id)}</i>", parse_mode=ParseMode.HTML)
+        elif data in ("m:credits", "m:limits"):   # m:limits = old "My Limits" button on earlier messages
+            await q.message.reply_text(self.credits_screen(update.effective_user.id),
                                        parse_mode=ParseMode.HTML, reply_markup=KB([home_row()]))
-        elif data == "m:credits":
-            await q.message.reply_text("💳 Credits: coming soon. Free limits reset daily at 00:00 UTC.",
-                                       reply_markup=KB([home_row()]))
         elif data in ("as:w", "as:c"):
             addr = ud.pop("pending_addr", None)
             if addr:
@@ -445,14 +535,26 @@ class MimicBot:
         ud["pending_addr"] = addr
         await update.effective_message.reply_text(
             f"Is <code>{short(addr)}</code> a wallet or a coin?", parse_mode=ParseMode.HTML,
-            reply_markup=KB([[B("🔍 Wallet", callback_data="as:w"), B("🪙 Coin", callback_data="as:c")]]))
+            reply_markup=KB([[B(f"🔍 Wallet · {texts.cost_label('wallet')}", callback_data="as:w"),
+                              B(f"🪙 Coin · {texts.cost_label('coin')}", callback_data="as:c")]]))
 
     async def on_error(self, update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("Unhandled error: %s", ctx.error, exc_info=ctx.error)
 
+    async def _post_init(self, app: Application) -> None:
+        try:
+            await app.bot.set_my_commands([BotCommand("menu", "Main menu"), BotCommand("credits", "Your credits"),
+                                           BotCommand("help", "How Mimic works")])
+        except TelegramError as e:
+            log.warning("set_my_commands failed: %s", e)
+
     def build_app(self, token: str) -> Application:
-        app = Application.builder().token(token).concurrent_updates(True).build()
-        app.add_handler(CommandHandler(["start", "menu", "help"], self.cmd_start))
+        app = Application.builder().token(token).concurrent_updates(True).post_init(self._post_init).build()
+        app.add_handler(CommandHandler(["start", "menu"], self.cmd_start))
+        app.add_handler(CommandHandler("help", self.cmd_help))
+        app.add_handler(CommandHandler(["credits", "balance"], self.cmd_credits))
+        app.add_handler(CommandHandler("grant", self.cmd_grant))
+        app.add_handler(CommandHandler("ledger", self.cmd_ledger))
         app.add_handler(CallbackQueryHandler(self.on_button))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         app.add_error_handler(self.on_error)

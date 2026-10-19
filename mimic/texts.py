@@ -154,12 +154,121 @@ def flagged_text(res: dict) -> str:
     return "\n".join(rows)
 
 
-def limits_text(usage: dict, user_id: int, now: float | None = None) -> str:
-    now = time.time() if now is None else now
-    left = int(86400 - now % 86400)
-    w, c, s = usage["wallet"], usage["coin"], usage["sim"]
-    return (f"📊 <b>Today</b>\n🔍 Wallet scans {w[0]}/{w[1]}\n🪙 Coin scans {c[0]}/{c[1]}\n🧪 Sims {s[0]}/{s[1]}\n"
-            f"Resets in {left // 3600}h {left % 3600 // 60}m (00:00 UTC)\nYour ID: <code>{user_id}</code>")
+# ---------------------------------------------------------------- credits
+KIND_LABELS = {"wallet": "Wallet Scan", "coin": "Coin Scan", "sim": "Copytrade Sim"}
+KIND_EMOJI = {"wallet": "🔍", "coin": "🪙", "sim": "🧪"}
+
+
+def wait_text(seconds: int) -> str:
+    s = max(0, int(seconds))
+    if s >= 3600:
+        return f"{s // 3600}h {s % 3600 // 60}m"
+    if s >= 60:
+        return f"{s // 60}m"
+    return f"{s}s"
+
+
+def cr(n: int) -> str:
+    return f"{n} credit{'' if n == 1 else 's'}"
+
+
+def cost_label(kind: str, costs: dict | None = None) -> str:
+    """'3 cr' style suffix for buttons."""
+    from . import config
+    c = (costs or config.COSTS).get(kind, 0)
+    return "free" if c == 0 else f"{c} cr"
+
+
+def balance_line(b, credits, now: float | None = None, admin: bool = False) -> str:
+    if admin:
+        return "💳 Credits: <b>unlimited</b> (admin)"
+    line = f"💳 Credits: <b>{b.total}</b> (free {b.free}/{credits.cap}, bought {b.bought})."
+    nxt = credits.next_refill_in(b, now)
+    if nxt is None:
+        line += " Free credits are full."
+    else:
+        line += f" Next +{credits.refill} in {wait_text(nxt)}"
+    return line
+
+
+def packs_note() -> str:
+    from . import config
+    if not config.PACKS:
+        return "💎 Credit packs are coming soon."
+    items = [f"{c} for {p:g} SOL" for c, p in config.PACKS]
+    return "💎 Credit packs are coming soon: " + ", ".join(items) + "."
+
+
+def costs_lines() -> list[str]:
+    from . import config
+    return [f"{KIND_EMOJI[k]} {KIND_LABELS[k]}: {cr(config.COSTS[k])}" for k in ("coin", "wallet", "sim")]
+
+
+def credits_text(b, credits, user_id: int, now: float | None = None, admin: bool = False) -> str:
+    hours = credits.interval_s / 3600
+    lines = [balance_line(b, credits, now, admin), "", "<b>Costs</b>"] + costs_lines() + [
+        "🏆 Best &amp; worst trades, 📊 Sim trades, ⚙️ Filters: free",
+        "",
+        f"🎁 You get <b>{credits.refill}</b> free credits every {hours:g}h, up to {credits.cap}.",
+        "Free credits are used first, then bought ones (bought credits never expire).",
+        "If a check fails, its credits come back automatically.",
+        packs_note(),
+        f"Your ID: <code>{user_id}</code>",
+    ]
+    return "\n".join(lines)
+
+
+def no_credits_text(kind: str, cost: int, b, credits, enough_in: int | None, now: float | None = None) -> str:
+    lines = [f"😅 Not enough credits for a {KIND_LABELS[kind]}: it costs <b>{cost}</b>, you have <b>{b.total}</b>.",
+             balance_line(b, credits, now)]
+    nxt = credits.next_refill_in(b, now)
+    if enough_in and nxt is not None and enough_in > nxt:
+        lines.append(f"You'll have enough in about {wait_text(enough_in)}.")
+    lines += ["", packs_note()]
+    return "\n".join(lines)
+
+
+def ledger_text(user_id: int, rows: list[dict]) -> str:
+    lines = [f"📒 <b>Credit ledger</b> · <code>{user_id}</code> (newest first, UTC)"]
+    if not rows:
+        lines.append("No entries.")
+    for r in rows:
+        when = time.strftime("%b %d %H:%M", time.gmtime(r["ts"]))
+        parts = []
+        if r["delta_free"]:
+            parts.append(f"free {r['delta_free']:+d}")
+        if r["delta_bought"]:
+            parts.append(f"bought {r['delta_bought']:+d}")
+        extra = ""
+        if r.get("check_id"):
+            extra += f" · check #{r['check_id']}"
+        if r.get("note"):
+            extra += " · " + html.escape(str(r["note"]))[:80]
+        lines.append(f"#{r['id']} {when} <b>{r['kind']}</b> {', '.join(parts) or '0'} → "
+                     f"{r['free_after']}/{r['bought_after']}{extra}")
+    return "\n".join(lines)
+
+
+def help_text() -> str:
+    from . import config
+    hours = config.REFILL_HOURS
+    return "\n".join([
+        "👋 <b>Mimic</b> checks if a Solana wallet is worth copying. Everything is buttons; just paste an address.",
+        "",
+        f"🔍 <b>Wallet Scan</b>: the wallet's last {config.SCAN_DAYS} days of coin buys, hit rates and hold times.",
+        "🪙 <b>Coin Scan</b>: real traders who made profit on a coin.",
+        "🧪 <b>Copytrade Sim</b>: what copying the wallet would have made.",
+        "🏆 Best &amp; worst trades and 📊 Sim trades are free extras on a result.",
+        "",
+        "<b>💳 Credits</b>",
+    ] + costs_lines() + [
+        f"🎁 {config.FREE_REFILL} free credits every {hours:g}h (up to {config.FREE_CAP}).",
+        f"Failed checks are refunded automatically. Repeats within {config.CACHE_TTL_S // 60} min are fast but still cost credits.",
+        f"There's a {config.COOLDOWN_S}s cooldown between checks.",
+        "",
+        "/credits: your balance · /menu: main menu",
+        "<i>Read-only: Mimic never trades and never asks for keys. Not financial advice.</i>",
+    ])
 
 
 # ---------------------------------------------------------------- best & worst trades

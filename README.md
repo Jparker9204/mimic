@@ -23,18 +23,26 @@ A Telegram bot that tells you whether a Solana wallet is worth copy-trading. Eve
   - **no real buy:** spent under 0.01 SOL in total.
   
   Only wallets that put in at least 0.05 SOL are ranked.
-- **🏆 Best & worst trades** (Wallet Scan button, free, from the cached scan, no check): the wallet's 5 best and 5 worst coins by profit in SOL (sells plus coins still held at today's price), with put in, held time, still-holding %, and a tap-to-copy mint. A luck check shows how much of the total comes from the best coin and the total without it.
+- **🏆 Best & worst trades** (Wallet Scan button, free, from the cached scan, no credits): the wallet's 5 best and 5 worst coins by profit in SOL (sells plus coins still held at today's price), with put in, held time, still-holding %, and a tap-to-copy mint. A luck check shows how much of the total comes from the best coin and the total without it.
 - **📊 Sim trades** (Copytrade Sim button, free): the sim's 5 best and 5 worst copied trades with result and exit reason, plus the total without the best trade.
 - **⚙️ Filters** (Coin Scan; saved per user, all buttons). Open them from the main menu or from a Coin Scan result.
   - **Presets:** 🐟 Small (put in 0.05–1 SOL, profit ≥0.1), 🐬 Mid (put in 1–10, profit ≥1), 🐳 Whale (put in ≥10, profit ≥5), and Any (the default).
   - **Custom (tap, then type a number):** min/max SOL put in, min profit SOL, min profit % (default 10), first N buyers.
   - **Toggles:** still holding (any / still holding / fully sold), sort by (profit SOL / profit % / earliest buyer).
-  - Applying a filter to a cached scan uses no check and makes no API calls.
-- **Limits** (per Telegram user, per UTC day): 5 wallet scans, 3 coin scans, 2 sims.
-  - 25s cooldown between checks, with a live countdown.
-  - At most 2 heavy jobs run at once; others are told "you're #N in line".
-  - Every check is logged with an ID (`Check #123 ✅`). Failed checks never count.
-  - **💳 Credits:** coming soon (stub).
+  - Applying a filter to a cached scan costs no credits and makes no API calls.
+- **💳 Credits** (per Telegram user). Every check costs credits; there are no separate daily limits.
+  - **Costs:** 🪙 Coin Scan 10 · 🔍 Wallet Scan 3 · 🧪 Copytrade Sim 15. Free extras from cached results (🏆 Best & worst trades, 📊 Sim trades, ⚙️ Filters) cost nothing. Costs are shown on the buttons.
+  - **Free credits:** +40 every 6 hours, stacking up to 500 (no more however long you're away). New accounts start with 40, and users from before credits get 40 on their first use after the update. Refills are computed lazily from a last-refill timestamp, so no background job runs.
+  - **Purchased credits:** a second balance with no cap that never expires. Free credits are spent first, then purchased. Payments aren't live yet; the "out of credits" message says packs are coming soon (100 for 0.05 SOL, 250 for 0.1 SOL).
+  - **Balance** shows on the main menu and in `/credits`, e.g. `💳 Credits: 120 (free 80/500, bought 40). Next +40 in 3h 12m`. Each finished check shows what it cost and what's left.
+  - **Refunds:** if a check fails (data source busy, rate limits, errors, or the bot restarts mid-check), its credits go back to the same balances automatically. Cache hits (repeat within 45 min) still cost credits, so the price is predictable.
+  - **Ledger:** every change (signup, migrate, refill, spend, refund, grant) is stored in the `credit_ledger` table with the balance after, check ID and admin ID, for refund disputes.
+  - **Admins** (`MIMIC_ADMIN_IDS`) are unlimited: no cost, no cooldown. Admin-only commands:
+    - `/grant <telegram_id> <amount> [note]` adds purchased credits (negative removes them, never below 0), for testing and refunds.
+    - `/ledger <telegram_id>` shows the user's latest 20 credit changes.
+  - Users find their Telegram ID under 💳 Credits.
+  - All of these numbers can be changed in `/etc/mimic.env` (see Settings).
+- **Fair use:** 25s cooldown between checks, with a live countdown. One check at a time per user. At most 2 heavy jobs run at once; others are told "you're #N in line". Every check is logged with an ID (`Check #123 ✅`).
 - **Caching:** SQLite. Scans and prices are kept for 45 min, and parsed transactions for 20 days, so repeat checks are fast and free APIs aren't hammered.
 
 ## Data sources (all free)
@@ -60,6 +68,22 @@ The bot runs as the `mimic` user under systemd (`mimic-bot`, `Restart=always`, m
 ## Settings
 These live in `/etc/mimic.env` (root-only, chmod 600); see `deploy/mimic.env.example`. Secrets are never stored in the repo.
 
+All credit numbers are optional. Leave a line out to keep the default. After editing, apply with `sudo systemctl restart mimic-bot`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIMIC_COST_COIN` | 10 | credits per Coin Scan |
+| `MIMIC_COST_WALLET` | 3 | credits per Wallet Scan |
+| `MIMIC_COST_SIM` | 15 | credits per Copytrade Sim |
+| `MIMIC_FREE_REFILL` | 40 | free credits added each interval (also the starting balance) |
+| `MIMIC_REFILL_HOURS` | 6 | refill interval in hours (decimals allowed, e.g. 0.5) |
+| `MIMIC_FREE_CAP` | 500 | free credits never stack above this |
+| `MIMIC_PACKS` | `100:0.05,250:0.1` | packs shown in the "coming soon" note, as `credits:SOL` pairs (display only; no payments) |
+| `MIMIC_COOLDOWN_S` | 25 | seconds between checks |
+| `MIMIC_ADMIN_IDS` | (none) | comma-separated Telegram IDs: no cost, no cooldown, can use `/grant` and `/ledger` |
+
+Changing costs or refill settings never changes balances people already have; it only applies to future spends and refills.
+
 ## Development
 ```bash
 python3.10 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
@@ -72,5 +96,5 @@ python3.10 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 - **Peak hit rates:** these use 15-min candles that start after the buy, so the first minutes of a pump are skipped (this understates the hit rate). Only the 40 newest coins are charted per scan.
 - **Coin Scan (v2, per-wallet):** it picks about 40 wallets (top 20 holders plus the biggest recent traders from GeckoTerminal) and reads each wallet's **own** token-account history for that coin. A wallet's profit is only shown after its whole history on the coin has been read. Wallets with more than 40 trades on the coin are skipped as bots. Wallets that sold out before the newest ~300 pool trades and aren't top holders can be missed. Trades paid in WBTC, USDC, or another pair's quote token are valued at today's price of that token.
 - **Top holders** (`getTokenLargestAccounts`) are refused by every public RPC we tried. Without `MIMIC_RPC_URL` Mimic tries Alchemy's public demo endpoint, which is often rate-limited, and then says "Top-holder list was unavailable". **A free Helius key is strongly recommended**: it gives reliable top holders and faster history reads.
-- **Rate limits are never hidden:** if most reads fail, the check stops with "data source busy, try again" and doesn't count.
+- **Rate limits are never hidden:** if most reads fail, the check stops with "data source busy, try again" and its credits are refunded.
 - **Past results don't predict the future.** This is not financial advice.

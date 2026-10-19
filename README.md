@@ -32,9 +32,9 @@ A Telegram bot that tells you whether a Solana wallet is worth copy-trading. Eve
   - Applying a filter to a cached scan costs no credits and makes no API calls.
 - **💳 Credits** (per Telegram user). Every check costs credits; there are no separate daily limits.
   - **Costs:** 🪙 Coin Scan 10 · 🔍 Wallet Scan 3 · 🧪 Copytrade Sim 15. Free extras from cached results (🏆 Best & worst trades, 📊 Sim trades, ⚙️ Filters) cost nothing. Costs are shown on the buttons.
-  - **Free credits:** +40 every 6 hours, stacking up to 500 (no more however long you're away). New accounts start with 40, and users from before credits get 40 on their first use after the update. Refills are computed lazily from a last-refill timestamp, so no background job runs.
+  - **Free credits:** +40 every 6 hours, stacking up to 150 (no more however long you're away). New accounts start with 40, and users from before credits get 40 on their first use after the update. Refills are computed lazily from a last-refill timestamp, so no background job runs.
   - **Purchased credits:** a second balance with no cap that never expires. Free credits are spent first, then purchased. Payments aren't live yet; the "out of credits" message says packs are coming soon (100 for 0.05 SOL, 250 for 0.1 SOL).
-  - **Balance** shows on the main menu and in `/credits`, e.g. `💳 Credits: 120 (free 80/500, bought 40). Next +40 in 3h 12m`. Each finished check shows what it cost and what's left.
+  - **Balance** shows on the main menu and in `/credits`, e.g. `💳 Credits: 120 (free 80/150, bought 40). Next +40 in 3h 12m`. Each finished check shows what it cost and what's left.
   - **Refunds:** if a check fails (data source busy, rate limits, errors, or the bot restarts mid-check), its credits go back to the same balances automatically. Cache hits (repeat within 45 min) still cost credits, so the price is predictable.
   - **Ledger:** every change (signup, migrate, refill, spend, refund, grant) is stored in the `credit_ledger` table with the balance after, check ID and admin ID, for refund disputes.
   - **Admins** (`MIMIC_ADMIN_IDS`) are unlimited: no cost, no cooldown. Admin-only commands:
@@ -77,7 +77,7 @@ All credit numbers are optional. Leave a line out to keep the default. After edi
 | `MIMIC_COST_SIM` | 15 | credits per Copytrade Sim |
 | `MIMIC_FREE_REFILL` | 40 | free credits added each interval (also the starting balance) |
 | `MIMIC_REFILL_HOURS` | 6 | refill interval in hours (decimals allowed, e.g. 0.5) |
-| `MIMIC_FREE_CAP` | 500 | free credits never stack above this |
+| `MIMIC_FREE_CAP` | 150 | free credits never stack above this |
 | `MIMIC_PACKS` | `100:0.05,250:0.1` | packs shown in the "coming soon" note, as `credits:SOL` pairs (display only; no payments) |
 | `MIMIC_COOLDOWN_S` | 25 | seconds between checks |
 | `MIMIC_ADMIN_IDS` | (none) | comma-separated Telegram IDs: no cost, no cooldown, can use `/grant` and `/ledger` |

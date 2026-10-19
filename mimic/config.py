@@ -37,7 +37,7 @@ COSTS = {
 }
 FREE_REFILL = max(0, _int("MIMIC_FREE_REFILL", 40))          # free credits added per interval (also the start balance)
 REFILL_HOURS = max(0.01, _float("MIMIC_REFILL_HOURS", 6))    # refill interval
-FREE_CAP = max(0, _int("MIMIC_FREE_CAP", 500))               # free credits never stack above this
+FREE_CAP = max(0, _int("MIMIC_FREE_CAP", 150))               # free credits never stack above this
 
 
 def _packs(raw: str) -> list[tuple[int, float]]:

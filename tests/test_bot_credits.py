@@ -34,7 +34,7 @@ class FakeCtx:
 def mb(monkeypatch):
     db = DB(":memory:")
     b = botmod.MimicBot(db)
-    b.limits = Limits(db, credits=Credits(db, refill=40, interval_h=6, cap=500),
+    b.limits = Limits(db, credits=Credits(db, refill=40, interval_h=6, cap=150),
                       costs={"wallet": 3, "coin": 10, "sim": 15}, cooldown_s=0, admins={999})
     return b
 

@@ -12,7 +12,7 @@ COSTS = {"wallet": 3, "coin": 10, "sim": 15}
 @pytest.fixture
 def lim():
     db = DB(":memory:")
-    cr = Credits(db, refill=40, interval_h=6, cap=500)
+    cr = Credits(db, refill=40, interval_h=6, cap=150)
     return db, Limits(db, credits=cr, costs=COSTS, cooldown_s=25, admins={999})
 
 

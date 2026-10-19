@@ -11,26 +11,26 @@ P = 6 * H
 
 @pytest.fixture
 def cr():
-    return Credits(DB(":memory:"), refill=40, interval_h=6, cap=500)
+    return Credits(DB(":memory:"), refill=40, interval_h=6, cap=150)
 
 
 # ---------------------------------------------------------------- refill math
 def test_refill_partial_periods():
-    assert refill_math(0, T0, T0 + P - 1, 40, P, 500) == (0, T0, 0)          # not yet
-    assert refill_math(0, T0, T0 + P, 40, P, 500) == (40, T0 + P, 40)        # exactly one
+    assert refill_math(0, T0, T0 + P - 1, 40, P, 150) == (0, T0, 0)          # not yet
+    assert refill_math(0, T0, T0 + P, 40, P, 150) == (40, T0 + P, 40)        # exactly one
     # 2.5 periods: two refills, clock keeps the half period of progress
-    assert refill_math(10, T0, T0 + 2.5 * P, 40, P, 500) == (90, T0 + 2 * P, 80)
+    assert refill_math(10, T0, T0 + 2.5 * P, 40, P, 150) == (90, T0 + 2 * P, 80)
 
 
 def test_refill_cap_and_inactive_users():
     # a year away still ends at the cap, never beyond
-    assert refill_math(40, T0, T0 + 365 * 86400, 40, P, 500)[0] == 500
-    assert refill_math(480, T0, T0 + P, 40, P, 500) == (500, T0 + P, 20)
+    assert refill_math(40, T0, T0 + 365 * 86400, 40, P, 150)[0] == 150
+    assert refill_math(130, T0, T0 + P, 40, P, 150) == (150, T0 + P, 20)
     # at/above the cap: clock moves, nothing added, nothing taken away
-    assert refill_math(500, T0, T0 + 3 * P, 40, P, 500) == (500, T0 + 3 * P, 0)
-    assert refill_math(510, T0, T0 + P, 40, P, 500) == (510, T0 + P, 0)
+    assert refill_math(150, T0, T0 + 3 * P, 40, P, 150) == (150, T0 + 3 * P, 0)
+    assert refill_math(160, T0, T0 + P, 40, P, 150) == (160, T0 + P, 0)
     # clock going backwards never breaks anything
-    assert refill_math(10, T0, T0 - 100, 40, P, 500) == (10, T0, 0)
+    assert refill_math(10, T0, T0 - 100, 40, P, 150) == (10, T0, 0)
 
 
 def test_new_account_starts_with_40_and_refills_lazily(cr):
@@ -40,7 +40,7 @@ def test_new_account_starts_with_40_and_refills_lazily(cr):
     b = cr.balance(1, now=T0 + 13 * H)               # 2 full periods + 1h
     assert b.free == 120 and cr.next_refill_in(b, now=T0 + 13 * H) == 5 * H
     b = cr.balance(1, now=T0 + 1000 * P)
-    assert b.free == 500 and cr.next_refill_in(b, now=T0 + 1000 * P) is None
+    assert b.free == 150 and cr.next_refill_in(b, now=T0 + 1000 * P) is None
     kinds = [r["kind"] for r in cr.ledger(1)]
     assert kinds == ["refill", "refill", "signup"]
 
@@ -73,7 +73,7 @@ def test_purchased_credits_no_cap_and_grant_rules(cr):
     b = cr.grant(1, 10_000, actor=999, now=T0)
     assert b.bought == 10_000 and b.total == 10_040
     b = cr.balance(1, now=T0 + 100 * P)
-    assert (b.free, b.bought) == (500, 10_000)       # cap is free credits only; bought never expire
+    assert (b.free, b.bought) == (150, 10_000)       # cap is free credits only; bought never expire
     b = cr.grant(1, -4_000, actor=999, note="refund dispute", now=T0 + 100 * P)
     assert b.bought == 6_000
     with pytest.raises(InsufficientCredits):
@@ -99,7 +99,7 @@ def test_migration_existing_users_get_40_once():
     cid = db.start_check(5, "wallet", "x", now=T0 - 86400)       # used the bot before credits
     db.finish_check(cid, True, now=T0 - 86400)
     db.set_setting(6, "coin_filter", {"preset": "any"})           # only saved a filter
-    cr = Credits(db, refill=40, interval_h=6, cap=500)
+    cr = Credits(db, refill=40, interval_h=6, cap=150)
     for uid in (5, 6):
         b = cr.balance(uid, now=T0)
         assert (b.free, b.bought) == (40, 0)
@@ -122,7 +122,7 @@ def test_migration_on_old_database_file(tmp_path):
     c.close()
     db = DB(path)
     assert db.fail_stale_running() == [2]
-    cr = Credits(db, refill=40, interval_h=6, cap=500)
+    cr = Credits(db, refill=40, interval_h=6, cap=150)
     assert cr.refund(2) == 0                                       # old checks never charged
     assert cr.balance(42, now=T0).free == 40 and cr.ledger(42)[0]["kind"] == "migrate"
 
@@ -132,14 +132,14 @@ def test_time_until_enough(cr):
     assert cr.time_until(b, 15, now=T0 + H) == 5 * H                 # one refill
     assert cr.time_until(b, 100, now=T0 + H) == 3 * P - H            # 5 + 3*40 >= 100
     assert cr.time_until(b, 3, now=T0) == 0
-    assert cr.time_until(b, 600, now=T0) is None                    # beyond the free cap
+    assert cr.time_until(b, 200, now=T0) is None                    # beyond the free cap
 
 
 def test_balance_line_and_texts(cr):
     b = Balance(80, 40, T0)
     line = texts.balance_line(b, cr, now=T0 + 2 * H + 48 * 60)
-    assert "Credits: <b>120</b> (free 80/500, bought 40). Next +40 in 3h 12m" in line
-    assert "full" in texts.balance_line(Balance(500, 0, T0), cr, now=T0)
+    assert "Credits: <b>120</b> (free 80/150, bought 40). Next +40 in 3h 12m" in line
+    assert "full" in texts.balance_line(Balance(150, 0, T0), cr, now=T0)
     assert "unlimited" in texts.balance_line(None, cr, admin=True)
     msg = texts.no_credits_text("sim", 15, Balance(5, 0, T0), cr, 5 * H, now=T0 + H)
     assert "costs <b>15</b>" in msg and "Next +40 in 5h 0m" in msg
@@ -170,3 +170,4 @@ def test_env_overrides(monkeypatch):
             monkeypatch.delenv(k, raising=False)
         importlib.reload(config)
     assert config.COSTS == {"coin": 10, "wallet": 3, "sim": 15}
+    assert (config.FREE_REFILL, config.REFILL_HOURS, config.FREE_CAP) == (40, 6.0, 150)

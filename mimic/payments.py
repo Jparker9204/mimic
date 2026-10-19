@@ -254,13 +254,17 @@ class Payments:
     def seen(self, signature: str) -> bool:
         return bool(self.db.conn.execute("SELECT 1 FROM pay_txs WHERE signature=?", (signature,)).fetchone())
 
-    def known_reference(self, keys: list[str]) -> bool:
-        """Does a tx carry any of our order references? (then the reference check handles it)"""
+    def referenced_order(self, keys: list[str]) -> Order | None:
+        """The order whose reference this tx carries, if any."""
         ks = [k for k in keys if k]
         if not ks:
-            return False
+            return None
         q = ",".join("?" * len(ks))
-        return bool(self.db.conn.execute(f"SELECT 1 FROM pay_orders WHERE reference IN ({q}) LIMIT 1", ks).fetchone())
+        return self._row(self.db.conn.execute(f"SELECT {ORDER_COLS} FROM pay_orders WHERE reference IN ({q}) LIMIT 1",
+                                              ks).fetchone())
+
+    def known_reference(self, keys: list[str]) -> bool:
+        return self.referenced_order(keys) is not None
 
     def record_unmatched(self, signature: str, lamports: int, block_time: float | None, note: str,
                          now: float | None = None) -> None:
@@ -489,8 +493,16 @@ class PaymentWatcher:
                 if tx is None:
                     break
                 keys = tx_keys(tx)
-                if not self.pay.known_reference(keys):
-                    chk = verify_tx(tx, address, None)
+                ref_o = self.pay.referenced_order(keys)
+                chk = verify_tx(tx, address, None)
+                if ref_o is not None and chk.ok and (ref_o.status == "paid"
+                                                     or ref_o.created_at < (now or time.time()) - config.LATE_PAYMENT_S):
+                    # e.g. a second payment for an order that was already paid: no longer polled by
+                    # reference, so keep it visible for an admin instead of losing it
+                    self.pay.record_unmatched(sig, chk.lamports, tx.get("blockTime"),
+                                              f"extra payment for order #{ref_o.id} ({ref_o.status})", now)
+                    log.warning("extra payment for order %s recorded (see /orders)", ref_o.id)
+                elif ref_o is None:
                     if chk.ok:
                         o = self.pay.match_manual(chk.lamports, tx.get("blockTime"), address, now)
                         if o is None:

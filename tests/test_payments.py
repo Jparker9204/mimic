@@ -520,3 +520,16 @@ async def test_bot_custom_amount(mbot):
     upd.effective_message.text = "0,07"
     await mbot.on_text(upd, ctx)
     assert "0.07 SOL = 70 credits" in log[-1][1] and "await" not in ctx.user_data
+
+
+async def test_address_scan_records_extra_payment_for_paid_order(watcher):
+    pay, rpc = watcher.pay, watcher.rpc
+    pay.state_set("cursor:" + ADDR, "")
+    o = pay.create(1, 1, 50_000_000, now=T0)
+    pay.apply_tx(o.id, "FIRST", TxCheck(True, 50_000_000), now=T0 + 30)
+    rpc.sigs[ADDR] = [{"signature": "AGAIN", "err": None}]
+    rpc.txs["AGAIN"] = mktx(reference=o.reference)
+    assert await watcher.scan_address(ADDR, now=T0 + 90) == []
+    u = pay.unmatched()
+    assert [x["signature"] for x in u] == ["AGAIN"] and f"order #{o.id}" in u[0]["note"]
+    assert bal(pay).bought == 50

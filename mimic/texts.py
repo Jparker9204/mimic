@@ -320,10 +320,11 @@ def orders_text(orders: list, unmatched: list[dict]) -> str:
             line += f" · got {fmt_sol(o.received_lamports)} SOL (short)"
         lines.append(line)
     if unmatched:
-        lines += ["", "<b>Unmatched incoming payments</b> (no reference; credit with /grant if you can tell whose):"]
+        lines += ["", "<b>Unmatched incoming payments</b> (credit with /grant if you can tell whose):"]
         for u in unmatched:
             when = time.strftime("%b %d %H:%M", time.gmtime(u["block_time"])) if u.get("block_time") else "?"
-            lines.append(f"{when} · {fmt_sol(u['lamports'])} SOL · tx {tx_link(u['signature'])}")
+            lines.append(f"{when} · {fmt_sol(u['lamports'])} SOL · tx {tx_link(u['signature'])} · "
+                         f"{html.escape(u.get('note') or '')}")
     return "\n".join(lines)
 
 

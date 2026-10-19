@@ -143,28 +143,23 @@ def test_balance_line_and_texts(cr):
     assert "unlimited" in texts.balance_line(None, cr, admin=True)
     msg = texts.no_credits_text("sim", 15, Balance(5, 0, T0), cr, 5 * H, now=T0 + H)
     assert "costs <b>15</b>" in msg and "Next +40 in 5h 0m" in msg
-    assert "100 for 0.05 SOL, 250 for 0.1 SOL" in msg and "coming soon" in msg
+    assert "Buy" in msg and "SOL" in msg
     assert "Coin Scan: 10 credits" in texts.help_text()
 
 
 def test_env_overrides(monkeypatch):
     from mimic import config
     env = {"MIMIC_COST_COIN": "12", "MIMIC_COST_WALLET": "0", "MIMIC_COST_SIM": "20", "MIMIC_FREE_REFILL": "25",
-           "MIMIC_REFILL_HOURS": "4", "MIMIC_FREE_CAP": "300", "MIMIC_PACKS": "200:0.08, 1000:0.3"}
+           "MIMIC_REFILL_HOURS": "4", "MIMIC_FREE_CAP": "300"}
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     try:
         importlib.reload(config)
         assert config.COSTS == {"coin": 12, "wallet": 0, "sim": 20}
         assert (config.FREE_REFILL, config.REFILL_HOURS, config.FREE_CAP) == (25, 4.0, 300)
-        assert config.PACKS == [(200, 0.08), (1000, 0.3)]
-        assert "200 for 0.08 SOL, 1000 for 0.3 SOL" in texts.packs_note()
         assert texts.cost_label("wallet") == "free"
         c = Credits(DB(":memory:"))
         assert (c.refill, c.interval_s, c.cap) == (25, 4 * H, 300)
-        monkeypatch.setenv("MIMIC_PACKS", "garbage")
-        importlib.reload(config)
-        assert config.PACKS == [(100, 0.05), (250, 0.1)]
     finally:
         for k in env:
             monkeypatch.delenv(k, raising=False)

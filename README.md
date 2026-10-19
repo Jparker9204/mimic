@@ -33,15 +33,29 @@ A Telegram bot that tells you whether a Solana wallet is worth copy-trading. Eve
 - **💳 Credits** (per Telegram user). Every check costs credits; there are no separate daily limits.
   - **Costs:** 🪙 Coin Scan 10 · 🔍 Wallet Scan 3 · 🧪 Copytrade Sim 15. Free extras from cached results (🏆 Best & worst trades, 📊 Sim trades, ⚙️ Filters) cost nothing. Costs are shown on the buttons.
   - **Free credits:** +40 every 6 hours, stacking up to 150 (no more however long you're away). New accounts start with 40, and users from before credits get 40 on their first use after the update. Refills are computed lazily from a last-refill timestamp, so no background job runs.
-  - **Purchased credits:** a second balance with no cap that never expires. Free credits are spent first, then purchased. Payments aren't live yet; the "out of credits" message says packs are coming soon (100 for 0.05 SOL, 250 for 0.1 SOL).
+  - **Purchased credits:** a second balance with no cap that never expires. Free credits are spent first, then purchased. Bought with SOL (see **💎 Buy credits** below) or granted by an admin.
   - **Balance** shows on the main menu and in `/credits`, e.g. `💳 Credits: 120 (free 80/150, bought 40). Next +40 in 3h 12m`. Each finished check shows what it cost and what's left.
   - **Refunds:** if a check fails (data source busy, rate limits, errors, or the bot restarts mid-check), its credits go back to the same balances automatically. Cache hits (repeat within 45 min) still cost credits, so the price is predictable.
   - **Ledger:** every change (signup, migrate, refill, spend, refund, grant) is stored in the `credit_ledger` table with the balance after, check ID and admin ID, for refund disputes.
   - **Admins** (`MIMIC_ADMIN_IDS`) are unlimited: no cost, no cooldown. Admin-only commands:
     - `/grant <telegram_id> <amount> [note]` adds purchased credits (negative removes them, never below 0), for testing and refunds.
     - `/ledger <telegram_id>` shows the user's latest 20 credit changes.
+    - `/orders [telegram_id]` shows the latest SOL orders (status, SOL received, credits, tx link) and unmatched incoming payments.
   - Users find their Telegram ID under 💳 Credits.
   - All of these numbers can be changed in `/etc/mimic.env` (see Settings).
+- **💎 Buy credits with SOL** (main menu, `/buy`, the out-of-credits message and `/credits`). Uses [Solana Pay](https://docs.solanapay.com/spec) transfer requests.
+  - **Safety:** Mimic only *watches* a public receiving address (`MIMIC_PAY_ADDRESS`). It never generates, stores or uses a private key or seed, never connects to a wallet and never sends SOL. The user sends a normal SOL transfer from their own wallet.
+  - **Price:** credits = floor(SOL ÷ `MIMIC_PRICE_PER_CREDIT_SOL`), default 0.001 SOL per credit (1 SOL = 1000 credits). Minimum 0.02 SOL, maximum 5 SOL per purchase. Quick buttons 0.02 / 0.05 / 0.1 / 0.25 SOL, or ✏️ Custom amount. The user sees `0.05 SOL = 50 credits` and taps ✅ Confirm.
+  - **Order:** a random 32-byte *reference* public key (base58; no private key exists for it), the exact amount in lamports, the price, user and chat, created and expiry time (15 min). One open order per user; a new one replaces the old.
+  - **Payment message:** a QR code of the `solana:` link, then the amount, credits, the receiving address in tap-to-copy `<code>`, the full Solana Pay link (`solana:<address>?amount=0.05&reference=<ref>&label=Mimic&message=Mimic%20credits`), 📋 copy buttons for address, amount and link, ✅ I've paid (an immediate check) and ✖️ Cancel. Amounts are exact decimals (no float artifacts).
+  - **solana: button:** Telegram only accepts `http(s)://` and `tg://` URL buttons, so the bot tries a 💳 Pay with wallet button once and, when Telegram rejects it, sends the same message without it for the rest of the process (logged once). Phone users copy the address and amount into their wallet's Send screen; desktop users scan the QR with their phone wallet.
+  - **Verification** (background task, only calls the RPC while unpaid orders exist): every ~10s for open orders, `getSignaturesForAddress(reference)` at `finalized`, then `getTransaction` (`maxSupportedTransactionVersion` 0, retried with the version the RPC names). A payment counts when the tx has no error, the reference is among its account keys (incl. lookup-table ones), and the receiving address's balance went up (post − pre). It's credited when the total received reaches the amount (tolerance 0.000001 SOL).
+  - **Exactly once:** each signature is stored once (`pay_txs` primary key), and the credit is one DB transaction: order → paid, `pay_credits` row (UNIQUE order and UNIQUE signature), balance, and a `purchase` ledger entry with order, SOL and signature.
+  - **Overpayment** is credited on what actually arrived. **Underpayment** keeps the order open and tells the user what's missing, with a link for the rest. **Late payments** (after expiry or cancel) are still checked every ~60s for 24h and credited automatically.
+  - **Copied address + amount (no reference):** the bot also reads new finalized txs of the receiving address. A transfer with no order reference is matched when exactly one unpaid order (last 24h) has exactly that amount (or exactly its missing rest). Otherwise it's listed as *unmatched* in `/orders` so an admin can `/grant`.
+  - The user is told `✅ Payment received: 0.05 SOL → 50 credits. Tx: <solscan link>` (link previews off).
+  - `/terms`: credits are non-refundable except failed checks (automatic) or by admin decision. Not financial advice.
+  - The order and payment tables (`pay_orders`, `pay_txs`, `pay_credits`) plus `credit_ledger` are the refund-dispute record; nothing is deleted.
 - **Fair use:** 25s cooldown between checks, with a live countdown. One check at a time per user. At most 2 heavy jobs run at once; others are told "you're #N in line". Every check is logged with an ID (`Check #123 ✅`).
 - **Caching:** SQLite. Scans and prices are kept for 45 min, and parsed transactions for 20 days, so repeat checks are fast and free APIs aren't hammered.
 
@@ -78,11 +92,26 @@ All credit numbers are optional. Leave a line out to keep the default. After edi
 | `MIMIC_FREE_REFILL` | 40 | free credits added each interval (also the starting balance) |
 | `MIMIC_REFILL_HOURS` | 6 | refill interval in hours (decimals allowed, e.g. 0.5) |
 | `MIMIC_FREE_CAP` | 150 | free credits never stack above this |
-| `MIMIC_PACKS` | `100:0.05,250:0.1` | packs shown in the "coming soon" note, as `credits:SOL` pairs (display only; no payments) |
+| `MIMIC_PAY_ADDRESS` | (none) | **public** Solana address that receives payments (never a private key). Unset or invalid = "payments aren't available yet" |
+| `MIMIC_PRICE_PER_CREDIT_SOL` | 0.001 | SOL per credit; credits = floor(SOL ÷ price) |
+| `MIMIC_MIN_PURCHASE_SOL` | 0.02 | smallest purchase |
+| `MIMIC_MAX_PURCHASE_SOL` | 5 | largest purchase (sanity cap) |
+| `MIMIC_BUY_AMOUNTS` | `0.02,0.05,0.1,0.25` | quick-amount buttons (only those within min..max are shown) |
+| `MIMIC_ORDER_MINUTES` | 15 | how long a payment request is valid |
+| `MIMIC_LATE_PAYMENT_HOURS` | 24 | late payments are still credited this long after the order |
+| `MIMIC_PAY_URL_BUTTON` | 1 | set 0 to skip trying the `solana:` "Pay with wallet" button |
 | `MIMIC_COOLDOWN_S` | 25 | seconds between checks |
-| `MIMIC_ADMIN_IDS` | (none) | comma-separated Telegram IDs: no cost, no cooldown, can use `/grant` and `/ledger` |
+| `MIMIC_ADMIN_IDS` | (none) | comma-separated Telegram IDs: no cost, no cooldown, can use `/grant`, `/ledger` and `/orders` |
 
-Changing costs or refill settings never changes balances people already have; it only applies to future spends and refills.
+Changing costs or refill settings never changes balances people already have; it only applies to future spends and refills. Changing the price only affects new orders (each order stores its price).
+
+**Use a dedicated receiving wallet** for `MIMIC_PAY_ADDRESS` (a fresh Phantom account is fine). Other incoming transfers to it that happen to match an open order's exact amount could be credited to that order.
+
+### Testing payments safely
+1. Put your Telegram ID in `MIMIC_ADMIN_IDS`, set `MIMIC_PAY_ADDRESS`, and temporarily `MIMIC_MIN_PURCHASE_SOL=0.001` (keep the price at 0.001 so 0.001 SOL = 1 credit). `sudo systemctl restart mimic-bot`.
+2. In the bot: 💎 Buy credits → ✏️ Custom amount → `0.001` → ✅ Confirm. Pay from another wallet by scanning the QR (or copying address + amount).
+3. About 30–60s later you should get `✅ Payment received: 0.001 SOL → 1 credit`. Check `/orders` and `/ledger <your id>`.
+4. Remove the `MIMIC_MIN_PURCHASE_SOL` line and restart.
 
 ## Development
 ```bash

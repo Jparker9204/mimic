@@ -48,13 +48,13 @@ class Net:
             try:
                 r = await self.client.request(method, url, json=json)
             except (httpx.HTTPError, OSError) as exc:
-                log.debug("%s %s error: %s", bucket, url[:80], exc)
+                log.debug("%s request error: %s", bucket, type(exc).__name__)   # never log URLs (RPC keys)
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
             if r.status_code in (429, 413) or r.status_code >= 500:
                 back = min(30.0, 2.0 * (2 ** attempt)) + random.random()
                 self.limiter.penalize(bucket, back)
-                log.debug("%s %s -> %s, backoff %.1fs", bucket, url[:60], r.status_code, back)
+                log.debug("%s -> %s, backoff %.1fs", bucket, r.status_code, back)
                 continue
             if r.status_code >= 400:
                 return None

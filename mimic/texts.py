@@ -191,12 +191,140 @@ def balance_line(b, credits, now: float | None = None, admin: bool = False) -> s
     return line
 
 
-def packs_note() -> str:
+def buy_note() -> str:
+    """One line for /credits and the out-of-credits message."""
     from . import config
-    if not config.PACKS:
-        return "💎 Credit packs are coming soon."
-    items = [f"{c} for {p:g} SOL" for c, p in config.PACKS]
-    return "💎 Credit packs are coming soon: " + ", ".join(items) + "."
+    from .payments import fmt_sol
+    if not config.PAY_ADDRESS:
+        return "💎 Buying credits with SOL isn't available yet."
+    return (f"💎 Buy credits with SOL: 1 credit = {fmt_sol(config.PRICE_LAMPORTS)} SOL "
+            f"(minimum {fmt_sol(config.MIN_PURCHASE_LAMPORTS)} SOL). Tap 💎 Buy credits.")
+
+
+TERMS_SHORT = ("<i>Credits are non-refundable, except failed checks (refunded automatically) or by admin decision. "
+               "Not financial advice. /terms</i>")
+
+
+def buy_text() -> str:
+    from . import config
+    from .payments import credits_for, fmt_sol
+    if not config.PAY_ADDRESS:
+        return ("💎 <b>Buy credits</b>\nPayments aren't available yet. You still get free credits every "
+                f"{config.REFILL_HOURS:g}h.")
+    p = config.PRICE_LAMPORTS
+    return "\n".join([
+        "💎 <b>Buy credits with SOL</b>",
+        f"Rate: <b>1 credit = {fmt_sol(p)} SOL</b> (1 SOL = {credits_for(10 ** 9, p)} credits)",
+        f"Minimum {fmt_sol(config.MIN_PURCHASE_LAMPORTS)} SOL · maximum {fmt_sol(config.MAX_PURCHASE_LAMPORTS)} SOL",
+        "Bought credits never expire. Pick an amount:",
+        "",
+        TERMS_SHORT,
+    ])
+
+
+def buy_confirm_text(lamports: int) -> str:
+    from . import config
+    from .payments import credits_for, fmt_sol
+    return "\n".join([
+        f"💎 <b>{fmt_sol(lamports)} SOL = {credits_for(lamports)} credits</b>",
+        f"Next you'll get a payment request for exactly {fmt_sol(lamports)} SOL, valid for "
+        f"{config.ORDER_TTL_S // 60} minutes. Nothing is charged until you send it from your wallet.",
+    ])
+
+
+def payment_text(o, button: bool) -> str:
+    """The payment request (sent right after the QR code)."""
+    from . import config
+    from .payments import fmt_sol
+    amt = fmt_sol(o.lamports)
+    how = ("📱 <b>Phone:</b> tap <b>Pay with wallet</b> (opens Phantom/Solflare), or copy the address and amount "
+           "into your wallet's Send screen." if button else
+           "📱 <b>Phone:</b> copy the address and the amount into your wallet's Send screen (Phantom, Solflare…).")
+    return "\n".join([
+        f"💎 <b>Pay {amt} SOL → get {o.credits} credits</b>",
+        "",
+        f"Send exactly <b>{amt} SOL</b> to Mimic's wallet:",
+        f"<code>{o.recipient}</code>",
+        "",
+        how,
+        "💻 <b>Computer:</b> scan the QR code above with your phone's wallet app.",
+        "Solana Pay link (paste into a wallet that supports it):",
+        f"<code>{html.escape(o.url)}</code>",
+        "",
+        f"⏱ Valid for {config.ORDER_TTL_S // 60} minutes. Credits arrive automatically about 30–60 seconds after "
+        "you pay, and I'll message you.",
+        "",
+        "🔒 This is a normal SOL transfer to Mimic's wallet. Mimic never asks for your seed phrase or to "
+        "connect your wallet.",
+        f"<i>Order #{o.id} · Non-refundable except failed checks or by admin decision. Not financial advice.</i>",
+    ])
+
+
+def qr_caption(o) -> str:
+    from .payments import fmt_sol
+    return f"Scan with your wallet app to pay {fmt_sol(o.lamports)} SOL (order #{o.id})"
+
+
+def tx_link(sig: str) -> str:
+    return f'<a href="https://solscan.io/tx/{sig}">{sig[:4]}…{sig[-4:]}</a>'
+
+
+def paid_text(ev) -> str:
+    from .payments import fmt_sol
+    line = f"✅ Payment received: {fmt_sol(ev.received)} SOL → {cr(ev.credits)}. Tx: {tx_link(ev.signature)}"
+    if ev.late:
+        line += "\n<i>It arrived after the payment request expired; it still counts.</i>"
+    return line
+
+
+def short_text(ev) -> str:
+    from .payments import fmt_sol, pay_url
+    o = ev.order
+    rest = pay_url(o.recipient, ev.missing, o.reference)
+    return "\n".join([
+        f"⚠️ Received <b>{fmt_sol(ev.received)} SOL</b> of {fmt_sol(o.lamports)} SOL for order #{o.id} "
+        f"(tx {tx_link(ev.signature)}). <b>{fmt_sol(ev.missing)} SOL</b> is still missing.",
+        f"Send the remaining {fmt_sol(ev.missing)} SOL to <code>{o.recipient}</code>, or use this link:",
+        f"<code>{html.escape(rest)}</code>",
+        "Your credits are added as soon as the full amount has arrived.",
+    ])
+
+
+def terms_text() -> str:
+    return "\n".join([
+        "📄 <b>Terms</b>",
+        "• Credits pay for Mimic checks. Bought credits never expire.",
+        "• Credits are non-refundable, except: a failed check refunds its credits automatically, and an admin "
+        "can decide on a refund.",
+        "• Payments are normal SOL transfers on Solana and can't be reversed. Check the amount before you send.",
+        "• Mimic never asks for your seed phrase or private key and never connects to your wallet.",
+        "• Mimic shows past on-chain data. Not financial advice.",
+    ])
+
+
+ORDER_ICONS = {"open": "🕐", "paid": "✅", "expired": "⌛", "cancelled": "✖️", "replaced": "↪️"}
+
+
+def orders_text(orders: list, unmatched: list[dict]) -> str:
+    from .payments import fmt_sol
+    lines = ["🧾 <b>Recent orders</b> (newest first, UTC)"]
+    if not orders:
+        lines.append("No orders.")
+    for o in orders:
+        when = time.strftime("%b %d %H:%M", time.gmtime(o.created_at))
+        line = (f"#{o.id} {when} · <code>{o.user_id}</code> · {fmt_sol(o.lamports)} SOL → {o.credits} cr · "
+                f"{ORDER_ICONS.get(o.status, '')} {o.status}")
+        if o.status == "paid":
+            line += f" {fmt_sol(o.received_lamports)} SOL, +{o.credited} cr, tx {tx_link(o.signature)}"
+        elif o.received_lamports:
+            line += f" · got {fmt_sol(o.received_lamports)} SOL (short)"
+        lines.append(line)
+    if unmatched:
+        lines += ["", "<b>Unmatched incoming payments</b> (no reference; credit with /grant if you can tell whose):"]
+        for u in unmatched:
+            when = time.strftime("%b %d %H:%M", time.gmtime(u["block_time"])) if u.get("block_time") else "?"
+            lines.append(f"{when} · {fmt_sol(u['lamports'])} SOL · tx {tx_link(u['signature'])}")
+    return "\n".join(lines)
 
 
 def costs_lines() -> list[str]:
@@ -212,7 +340,7 @@ def credits_text(b, credits, user_id: int, now: float | None = None, admin: bool
         f"🎁 You get <b>{credits.refill}</b> free credits every {hours:g}h, up to {credits.cap}.",
         "Free credits are used first, then bought ones (bought credits never expire).",
         "If a check fails, its credits come back automatically.",
-        packs_note(),
+        buy_note(),
         f"Your ID: <code>{user_id}</code>",
     ]
     return "\n".join(lines)
@@ -224,7 +352,7 @@ def no_credits_text(kind: str, cost: int, b, credits, enough_in: int | None, now
     nxt = credits.next_refill_in(b, now)
     if enough_in and nxt is not None and enough_in > nxt:
         lines.append(f"You'll have enough in about {wait_text(enough_in)}.")
-    lines += ["", packs_note()]
+    lines += ["", buy_note()]
     return "\n".join(lines)
 
 
@@ -266,7 +394,7 @@ def help_text() -> str:
         f"Failed checks are refunded automatically. Repeats within {config.CACHE_TTL_S // 60} min are fast but still cost credits.",
         f"There's a {config.COOLDOWN_S}s cooldown between checks.",
         "",
-        "/credits: your balance · /menu: main menu",
+        "/credits: your balance · /buy: buy credits with SOL · /terms · /menu: main menu",
         "<i>Read-only: Mimic never trades and never asks for keys. Not financial advice.</i>",
     ])
 

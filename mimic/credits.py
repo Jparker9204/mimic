@@ -1,7 +1,7 @@
 """Credits: free credits (refilled lazily every N hours, capped) + purchased credits (no cap, never expire).
 
-Every change is written to the credit_ledger table (for refund disputes). No payments here:
-purchased credits can only be granted by an admin for now."""
+Every change is written to the credit_ledger table (for refund disputes). Purchased credits come from
+SOL payments (see payments.py, which calls add_purchased inside its own DB transaction) or admin grants."""
 from __future__ import annotations
 import time
 from contextlib import contextmanager
@@ -166,6 +166,18 @@ class Credits:
             self._save(c, uid, b)
             self._log(c, uid, "grant", 0, amount, b, now, actor=actor, note=note)
             return b
+
+    def add_purchased(self, c, uid: int, amount: int, now: float, note: str = "") -> tuple[Balance, int]:
+        """Add purchased credits INSIDE the caller's open transaction `c` (payments use this so the
+        payment record, order update and ledger entry commit together). Returns (balance, ledger_id)."""
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        b = self._load(c, uid, now)
+        b = Balance(b.free, b.bought + amount, b.last_refill)
+        self._save(c, uid, b)
+        self._log(c, uid, "purchase", 0, amount, b, now, note=note)
+        lid = int(c.execute("SELECT last_insert_rowid()").fetchone()[0])
+        return b, lid
 
     def ledger(self, uid: int, limit: int = 15) -> list[dict]:
         rows = self.db.conn.execute(

@@ -1,6 +1,7 @@
 """All settings come from environment variables (see deploy/mimic.env.example)."""
 from __future__ import annotations
 import os
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 
 
 def _int(name: str, default: int) -> int:
@@ -15,6 +16,13 @@ def _float(name: str, default: float) -> float:
         return float(os.getenv(name, "") or default)
     except ValueError:
         return default
+
+
+def _is_dec(x: str) -> bool:
+    try:
+        return Decimal(x).is_finite() and Decimal(x) > 0
+    except (InvalidOperation, ValueError):
+        return False
 
 
 BOT_TOKEN = (os.getenv("MIMIC_BOT_TOKEN") or "").strip()
@@ -40,20 +48,57 @@ REFILL_HOURS = max(0.01, _float("MIMIC_REFILL_HOURS", 6))    # refill interval
 FREE_CAP = max(0, _int("MIMIC_FREE_CAP", 150))               # free credits never stack above this
 
 
-def _packs(raw: str) -> list[tuple[int, float]]:
-    """Parse "100:0.05,250:0.1" into [(100, 0.05), (250, 0.1)]. Display only: payments aren't live."""
-    out = []
-    for part in raw.replace(" ", "").split(","):
-        try:
-            c, p = part.split(":")
-            if int(c) > 0 and float(p) > 0:
-                out.append((int(c), float(p)))
-        except ValueError:
-            continue
-    return out
+# ---- SOL credit purchases (Solana Pay). The bot only WATCHES a public receiving address:
+# it never holds a private key, never connects to a wallet and never sends funds.
+LAMPORTS = 10 ** 9
 
 
-PACKS = _packs(os.getenv("MIMIC_PACKS") or "") or [(100, 0.05), (250, 0.1)]
+def _sol_lamports(name: str, default: str) -> int:
+    """Read a SOL amount as exact integer lamports (Decimal, no float artifacts)."""
+    raw = (os.getenv(name) or "").strip() or default
+    try:
+        d = Decimal(raw)
+        if not d.is_finite() or d <= 0:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        d = Decimal(default)
+    return int((d * LAMPORTS).to_integral_value(rounding=ROUND_DOWN))
+
+
+def _pay_address(raw: str) -> str:
+    """The public receiving address, or "" when unset/invalid (base58 that decodes to 32 bytes)."""
+    raw = (raw or "").strip()
+    if not 32 <= len(raw) <= 44:
+        return ""
+    n = 0
+    for ch in raw:
+        i = _B58.find(ch)
+        if i < 0:
+            return ""
+        n = n * 58 + i
+    size = (n.bit_length() + 7) // 8 + (len(raw) - len(raw.lstrip("1")))
+    return raw if size == 32 else ""
+
+
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+PAY_ADDRESS = _pay_address(os.getenv("MIMIC_PAY_ADDRESS") or "")
+PAY_ADDRESS_INVALID = bool((os.getenv("MIMIC_PAY_ADDRESS") or "").strip()) and not PAY_ADDRESS
+PRICE_LAMPORTS = max(1, _sol_lamports("MIMIC_PRICE_PER_CREDIT_SOL", "0.001"))     # per credit
+MIN_PURCHASE_LAMPORTS = max(PRICE_LAMPORTS, _sol_lamports("MIMIC_MIN_PURCHASE_SOL", "0.02"))
+MAX_PURCHASE_LAMPORTS = max(MIN_PURCHASE_LAMPORTS, _sol_lamports("MIMIC_MAX_PURCHASE_SOL", "5"))
+# Quick-amount buttons on the buy screen (only those within min..max are shown)
+BUY_QUICK_LAMPORTS = sorted({_sol_lamports("_", x) for x in
+                             (os.getenv("MIMIC_BUY_AMOUNTS") or "0.02,0.05,0.1,0.25").replace(" ", "").split(",")
+                             if _is_dec(x)})
+ORDER_TTL_S = max(60, _int("MIMIC_ORDER_MINUTES", 15) * 60)        # payment request validity
+LATE_PAYMENT_S = max(0, _int("MIMIC_LATE_PAYMENT_HOURS", 24) * 3600)   # still credit payments this long after creation
+PAY_CHECK_S = max(3, _int("MIMIC_PAY_CHECK_S", 10))                # open orders checked this often
+PAY_LATE_CHECK_S = max(10, _int("MIMIC_PAY_LATE_CHECK_S", 60))     # expired/cancelled unpaid orders
+# Telegram only accepts http(s)/tg:// URL buttons; the bot tries a solana: "Pay with wallet" button once
+# and falls back to QR + copyable link if Telegram rejects it. Set 0 to skip the attempt.
+PAY_TRY_URL_BUTTON = (os.getenv("MIMIC_PAY_URL_BUTTON") or "1").strip() != "0"
+PAY_TOLERANCE_LAMPORTS = 1000                                      # 0.000001 SOL
+
 COOLDOWN_S = _int("MIMIC_COOLDOWN_S", 25)
 MAX_HEAVY_JOBS = _int("MIMIC_MAX_JOBS", 2)
 

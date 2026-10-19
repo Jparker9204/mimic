@@ -2,7 +2,7 @@
 from __future__ import annotations
 import asyncio
 import secrets, logging, time
-from telegram import BotCommand, InlineKeyboardButton as B, InlineKeyboardMarkup as KB, Update
+from telegram import BotCommand, CopyTextButton, InlineKeyboardButton as B, InlineKeyboardMarkup as KB, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -16,6 +16,7 @@ from .credits import InsufficientCredits
 from .limits import Limits
 from .market import Market
 from .net import Net
+from .payments import PaymentWatcher, Payments, PayRpc, check_amount, fmt_sol, parse_sol, qr_png
 from .scan import Services, wallet_scan
 from .sim import SimParams, build_trades, simulate
 from .solana import DataBusy, Rpc, is_address, short
@@ -31,7 +32,12 @@ def menu_kb() -> KB:
     cl = texts.cost_label
     return KB([[B(f"🔍 Wallet Scan · {cl('wallet')}", callback_data="m:wallet"),
                 B(f"🪙 Coin Scan · {cl('coin')}", callback_data="m:coin")],
-               [B("⚙️ Filters", callback_data="m:filters"), B("💳 Credits", callback_data="m:credits")]])
+               [B("⚙️ Filters", callback_data="m:filters"), B("💳 Credits", callback_data="m:credits")],
+               [B("💎 Buy credits", callback_data="buy")]])
+
+
+def buy_btn() -> B:
+    return B("💎 Buy credits", callback_data="buy")
 
 
 FILTER_PROMPTS = {
@@ -57,6 +63,13 @@ class MimicBot:
         self.net = Net()
         self.svc = Services(Rpc(self.net, self.db), Market(self.net, self.db))
         self.queue = JobQueue(config.MAX_HEAVY_JOBS)
+        self.pay = Payments(self.db, self.limits.credits)
+        self.watcher = PaymentWatcher(self.pay, PayRpc(self.net), self.on_pay_event)
+        self.pay_url_button: bool | None = None if config.PAY_TRY_URL_BUTTON else False
+        self.app: Application | None = None
+        self._watch_task: asyncio.Task | None = None
+        if config.PAY_ADDRESS_INVALID:
+            log.warning("MIMIC_PAY_ADDRESS is set but is not a valid Solana address: payments are off")
 
     # ---------------------------------------------------------------- helpers
     async def _edit(self, msg, text: str, kb: KB | None = None) -> None:
@@ -111,14 +124,15 @@ class MimicBot:
             else:
                 await self._send(chat_id, ctx, texts.no_credits_text(kind, v.cost, v.balance, self.limits.credits,
                                                                      v.enough_in),
-                                 KB([[B("💳 Credits", callback_data="m:credits")], home_row()]))
+                                 KB([[buy_btn(), B("💳 Credits", callback_data="m:credits")], home_row()]))
             return
         cid = self.db.start_check(user_id, kind, target)
         try:
             cost = self.limits.charge(user_id, kind, cid)
         except InsufficientCredits:
             self.db.finish_check(cid, False, "no credits")
-            await self._send(chat_id, ctx, "😅 Not enough credits for that.", KB([[B("💳 Credits", callback_data="m:credits")]]))
+            await self._send(chat_id, ctx, "😅 Not enough credits for that.",
+                             KB([[buy_btn(), B("💳 Credits", callback_data="m:credits")]]))
             return
 
         def refund(note: str) -> str:
@@ -315,7 +329,7 @@ class MimicBot:
 
     async def cmd_credits(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(self.credits_screen(update.effective_user.id),
-                                                  parse_mode=ParseMode.HTML, reply_markup=KB([home_row()]))
+                                                  parse_mode=ParseMode.HTML, reply_markup=KB([[buy_btn()], home_row()]))
 
     async def cmd_grant(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Admin only: /grant <telegram_id> <amount> [note]. Adds (or removes, if negative) purchased credits."""
@@ -356,6 +370,151 @@ class MimicBot:
         rows = self.limits.credits.ledger(target, 20)
         await update.effective_message.reply_text(texts.ledger_text(target, rows), parse_mode=ParseMode.HTML)
 
+    # ---------------------------------------------------------------- buying credits (SOL)
+    def buy_screen(self) -> tuple[str, KB]:
+        if not config.PAY_ADDRESS:
+            return texts.buy_text(), KB([home_row()])
+        amounts = [x for x in config.BUY_QUICK_LAMPORTS if check_amount(x) is None]
+        btns = [B(f"{fmt_sol(x)} SOL · {x // config.PRICE_LAMPORTS} cr", callback_data=f"buy:a:{x}") for x in amounts]
+        rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        rows += [[B("✏️ Custom amount", callback_data="buy:c")], home_row()]
+        return texts.buy_text(), KB(rows)
+
+    def buy_confirm(self, lamports: int) -> tuple[str, KB]:
+        return texts.buy_confirm_text(lamports), KB([[B("✅ Confirm", callback_data=f"buy:ok:{lamports}"),
+                                                      B("✏️ Change", callback_data="buy")]])
+
+    def payment_kb(self, o, url_button: bool, copy: bool) -> KB:
+        rows = []
+        if url_button:
+            rows.append([B("💳 Pay with wallet", url=o.url)])
+        if copy:
+            rows.append([B("📋 Copy address", copy_text=CopyTextButton(o.recipient)),
+                         B("📋 Copy amount", copy_text=CopyTextButton(fmt_sol(o.lamports)))])
+            rows.append([B("📋 Copy Solana Pay link", copy_text=CopyTextButton(o.url))])
+        rows.append([B("✅ I've paid", callback_data=f"pay:chk:{o.id}"), B("✖️ Cancel", callback_data=f"pay:x:{o.id}")])
+        return KB(rows)
+
+    async def send_payment(self, bot, chat_id: int, o):
+        """QR code first, then the payment request with buttons. Telegram only allows http(s)/tg:// URL
+        buttons, so a 'Pay with wallet' button holding the solana: link is tried once and, if Telegram
+        rejects it, dropped for the rest of the process (the QR code and the copyable link remain)."""
+        try:
+            await bot.send_photo(chat_id, qr_png(o.url), caption=texts.qr_caption(o))
+        except TelegramError as e:
+            log.warning("QR send failed: %s", e)
+        modes = ([(True, True)] if self.pay_url_button is not False else []) + [(False, True), (False, False)]
+        last = None
+        for url_button, copy in modes:
+            try:
+                msg = await bot.send_message(chat_id, texts.payment_text(o, url_button), parse_mode=ParseMode.HTML,
+                                             reply_markup=self.payment_kb(o, url_button, copy),
+                                             disable_web_page_preview=True)
+                if url_button and self.pay_url_button is None:
+                    self.pay_url_button = True
+                    log.info("Telegram accepted the solana: URL button")
+                return msg
+            except BadRequest as e:
+                last = e
+                log.warning("payment message rejected (url_button=%s copy=%s): %s", url_button, copy, e)
+                if url_button:
+                    self.pay_url_button = False
+        raise last
+
+    async def on_buy_button(self, update: Update, ctx, data: str) -> None:
+        q, ud = update.callback_query, ctx.user_data
+        uid, chat = update.effective_user.id, update.effective_chat.id
+        if data == "buy":
+            ud.pop("await", None)
+            t, kb = self.buy_screen()
+            await q.message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        if data.startswith("buy:") and not config.PAY_ADDRESS:
+            t, kb = self.buy_screen()
+            await q.message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
+        if data == "buy:c":
+            ud["await"] = "buy_amount"
+            await q.message.reply_text(f"✏️ Type an amount in SOL (minimum {fmt_sol(config.MIN_PURCHASE_LAMPORTS)}, "
+                                       f"maximum {fmt_sol(config.MAX_PURCHASE_LAMPORTS)}), e.g. 0.07")
+            return
+        if data.startswith("buy:a:") or data.startswith("buy:ok:"):
+            try:
+                lam = int(data.rsplit(":", 1)[1])
+            except ValueError:
+                return
+            err = check_amount(lam)
+            if err:
+                await q.message.reply_text(err, reply_markup=KB([[buy_btn()]]))
+                return
+            if data.startswith("buy:a:"):
+                t, kb = self.buy_confirm(lam)
+                await self._edit(q.message, t, kb)
+                return
+            o = self.pay.create(uid, chat, lam)
+            log.info("order %s created by %s", o.id, uid)
+            await self._edit(q.message, texts.buy_confirm_text(lam) + "\n\n✅ Payment request below 👇")
+            await self.send_payment(ctx.bot, chat, o)
+            return
+        try:
+            oid = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            return
+        o = self.pay.get(oid)
+        if o is None or o.user_id != uid:
+            return
+        if data.startswith("pay:x:"):
+            if self.pay.cancel(oid, uid):
+                await self._edit(q.message, f"✖️ Order #{oid} cancelled.\n<i>If you already sent SOL for it, it's still "
+                                            f"credited automatically.</i>", KB([[buy_btn()], home_row()]))
+            elif o.status == "paid":
+                await q.message.reply_text(f"Order #{oid} is already paid ✅", reply_markup=KB([home_row()]))
+            return
+        if data.startswith("pay:chk:"):
+            if o.status == "paid":
+                await q.message.reply_text(f"✅ Order #{oid} is paid: +{o.credited} credits.", reply_markup=KB([home_row()]))
+                return
+            last = ud.get("pay_chk", 0.0)
+            if time.monotonic() - last < 5:
+                return
+            ud["pay_chk"] = time.monotonic()
+            events = await self.watcher.check_order(o)
+            if not events:
+                await q.message.reply_text(
+                    "🔎 Not on the blockchain yet. A payment shows up about 30–60 seconds after you send it "
+                    "(Solana has to finalize it). I keep checking and will message you, no need to tap again.")
+
+    async def on_pay_event(self, ev) -> None:
+        if self.app is None:
+            return
+        if ev.kind == "paid":
+            text = texts.paid_text(ev) + "\n" + self.balance_line(ev.order.user_id)
+            kb = KB([home_row()])
+        else:
+            text = texts.short_text(ev)
+            kb = KB([[B("✅ I've paid", callback_data=f"pay:chk:{ev.order.id}")]])
+        await self.app.bot.send_message(ev.order.chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                        disable_web_page_preview=True)
+
+    async def cmd_buy(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        ctx.user_data.pop("await", None)
+        t, kb = self.buy_screen()
+        await update.effective_message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    async def cmd_terms(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(texts.terms_text(), parse_mode=ParseMode.HTML, reply_markup=KB([home_row()]))
+
+    async def cmd_orders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin only: /orders [telegram_id] shows recent SOL orders and unmatched payments."""
+        if not self.limits.is_admin(update.effective_user.id):
+            await update.effective_message.reply_text("This command is for admins only.")
+            return
+        args = ctx.args or []
+        target = int(args[0]) if args and args[0].isdigit() else None
+        t = texts.orders_text(self.pay.recent(15, target), self.pay.unmatched(5) if target is None else [])
+        for part in texts.split_message(t):
+            await update.effective_message.reply_text(part, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
     async def on_button(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
         data = q.data or ""
@@ -378,7 +537,9 @@ class MimicBot:
                                        f" · {self.balance_line(update.effective_user.id)}</i>", parse_mode=ParseMode.HTML)
         elif data in ("m:credits", "m:limits"):   # m:limits = old "My Limits" button on earlier messages
             await q.message.reply_text(self.credits_screen(update.effective_user.id),
-                                       parse_mode=ParseMode.HTML, reply_markup=KB([home_row()]))
+                                       parse_mode=ParseMode.HTML, reply_markup=KB([[buy_btn()], home_row()]))
+        elif data == "buy" or data.startswith("buy:") or data.startswith("pay:"):
+            await self.on_buy_button(update, ctx, data)
         elif data in ("as:w", "as:c"):
             addr = ud.pop("pending_addr", None)
             if addr:
@@ -488,6 +649,18 @@ class MimicBot:
         ud = ctx.user_data
         txt = (update.effective_message.text or "").strip()
         mode = ud.get("await")
+        if mode == "buy_amount":
+            lam = parse_sol(txt)
+            err = check_amount(lam)
+            if err:
+                await update.effective_message.reply_text(
+                    f"{err} Type an amount in SOL between {fmt_sol(config.MIN_PURCHASE_LAMPORTS)} and "
+                    f"{fmt_sol(config.MAX_PURCHASE_LAMPORTS)}, e.g. 0.07", reply_markup=KB([home_row()]))
+                return
+            ud.pop("await", None)
+            t, kb = self.buy_confirm(lam)
+            await update.effective_message.reply_text(t, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return
         if mode and mode.startswith("flt:"):
             key = mode[4:]
             try:
@@ -544,17 +717,29 @@ class MimicBot:
     async def _post_init(self, app: Application) -> None:
         try:
             await app.bot.set_my_commands([BotCommand("menu", "Main menu"), BotCommand("credits", "Your credits"),
-                                           BotCommand("help", "How Mimic works")])
+                                           BotCommand("buy", "Buy credits with SOL"),
+                                           BotCommand("help", "How Mimic works"), BotCommand("terms", "Terms")])
         except TelegramError as e:
             log.warning("set_my_commands failed: %s", e)
+        self._watch_task = asyncio.create_task(self.watcher.run_forever())
+        log.info("payments %s", "on (watching the receiving address, read-only)" if config.PAY_ADDRESS else "off")
+
+    async def _post_shutdown(self, app: Application) -> None:
+        if self._watch_task:
+            self._watch_task.cancel()
 
     def build_app(self, token: str) -> Application:
-        app = Application.builder().token(token).concurrent_updates(True).post_init(self._post_init).build()
+        app = (Application.builder().token(token).concurrent_updates(True).post_init(self._post_init)
+               .post_shutdown(self._post_shutdown).build())
+        self.app = app
         app.add_handler(CommandHandler(["start", "menu"], self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler(["credits", "balance"], self.cmd_credits))
         app.add_handler(CommandHandler("grant", self.cmd_grant))
         app.add_handler(CommandHandler("ledger", self.cmd_ledger))
+        app.add_handler(CommandHandler("buy", self.cmd_buy))
+        app.add_handler(CommandHandler("terms", self.cmd_terms))
+        app.add_handler(CommandHandler("orders", self.cmd_orders))
         app.add_handler(CallbackQueryHandler(self.on_button))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         app.add_error_handler(self.on_error)

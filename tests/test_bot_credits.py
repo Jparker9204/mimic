@@ -79,7 +79,7 @@ async def test_insufficient_credits_friendly_message(mb):
     ctx.bot.sent.clear()
     await mb.run_check(1, 1, ctx, "sim", "w", ok_work)
     msg = ctx.bot.sent[-1]
-    assert "Not enough credits" in msg and "Next +40 in" in msg and "coming soon" in msg
+    assert "Not enough credits" in msg and "Next +40 in" in msg and "💎" in msg
     assert mb.limits.credits.balance(1).total == 10
 
 
